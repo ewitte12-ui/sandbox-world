@@ -1,0 +1,20 @@
+[package]
+name = "metalworld"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bevy = { version = "0.18", features = ["debug"] }
+noise = "0.9"
+block-mesh = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+rand = "0.8"
+image = "0.25"
+rfd = "0.15"
+
+[profile.dev]
+opt-level = 1
+[profile.dev.package."*"]
+opt-level = 3

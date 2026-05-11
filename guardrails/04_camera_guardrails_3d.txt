@@ -1,0 +1,7 @@
+3D CAMERA GUARDRAILS
+
+- Camera stability is critical
+- No camera jitter at rest
+- Deterministic camera update order
+- Explicit occlusion handling
+- Horizon stability by default

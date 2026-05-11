@@ -1,0 +1,7 @@
+3D TRAVERSAL CONTRACT (VOXEL WORLDS)
+
+- Traversal must work without enemies
+- Height loss creates pressure, not punishment
+- Recovery must always exist
+- No half-affordances (walkable must be fully walkable)
+- Required vs optional traversal must be explicit

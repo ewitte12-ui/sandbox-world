@@ -9,6 +9,8 @@ use rand::Rng;
 use crate::block_types::BlockType;
 use crate::chunk_manager::ChunkManager;
 use crate::terrain;
+use crate::GameState;
+use crate::save_load::FileDialogOpen;
 
 // ── Mesh data helpers ─────────────────────────────────────────────────
 
@@ -804,8 +806,8 @@ pub struct AnimalData {
     pub animal_type: u32,
     pub local_time: f32,
     pub is_idle: bool,
-    /// True if this animal uses a loaded glTF model (no separate legs).
-    pub is_gltf: bool,
+    /// True if this animal uses a scene-based animated model.
+    pub is_scene: bool,
 }
 
 /// Resource holding all animal data and part entity references.
@@ -816,6 +818,21 @@ pub struct Animals {
     pub part_entities: Vec<Entity>,
     /// Leg height per type index, for ground offset calculation.
     pub leg_heights: [f32; 4],
+}
+
+/// Marker on scene root entities so we can find them to link animations.
+#[derive(Component)]
+pub struct AnimatedAnimal {
+    pub animal_index: usize,
+}
+
+/// Resource storing animation graph handles and node indices per animated type.
+#[derive(Resource)]
+pub struct AnimalAnimations {
+    /// (graph_handle, walk_node_index) per animated type key
+    pub horse: (Handle<AnimationGraph>, AnimationNodeIndex),
+    pub raccoon: (Handle<AnimationGraph>, AnimationNodeIndex),
+    pub dinosaur: (Handle<AnimationGraph>, AnimationNodeIndex),
 }
 
 /// Marker component on each animal entity.
@@ -840,8 +857,24 @@ pub struct AnimalPlugin;
 
 impl Plugin for AnimalPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn_animals)
-            .add_systems(Update, update_animals);
+        // DEPENDENCY: requires ChunkManagerPlugin (for ground height queries).
+        // spawn_animals runs at Startup and uses terrain::terrain_height_at()
+        // directly (ChunkManager may not have chunks loaded yet at Startup).
+        // update_animals runs in Update and queries ChunkManager for ground
+        // height, falling back to terrain generation if chunks aren't loaded.
+        app.add_systems(Update, spawn_animals.in_set(crate::WorldSpawnSet))
+            // setup_animal_animations must run before update_animals because
+            // it attaches AnimationGraphs that update_animals then controls.
+            // setup_animal_animations runs always (one-time graph attachment
+            // after scene loads). update_animals is gated to Gameplay only.
+            .add_systems(Update, setup_animal_animations
+                .run_if(in_state(GameState::Gameplay)))
+            .add_systems(
+                Update,
+                update_animals
+                    .run_if(in_state(GameState::Gameplay))
+                    .run_if(not(resource_exists::<FileDialogOpen>)),
+            );
     }
 }
 
@@ -854,7 +887,7 @@ fn animal_ground_height(x: f32, z: f32, cm: Option<&ChunkManager>) -> f32 {
         let bz = z.floor() as i32;
         let sy = terrain::surface_y(bx, bz);
         for by in (sy - 20..=sy + 2).rev() {
-            if manager.block_at(IVec3::new(bx, by, bz)) != BlockType::Air {
+            if manager.block_at(IVec3::new(bx, by, bz)) != BlockType::AIR {
                 return (by + 1) as f32;
             }
         }
@@ -869,6 +902,8 @@ fn spawn_animals(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     asset_server: Res<AssetServer>,
+    mut graphs: ResMut<Assets<AnimationGraph>>,
+    world_id: Res<crate::WorldInstanceId>,
 ) {
     let mut rng = rand::thread_rng();
     let plans = all_body_plans();
@@ -881,7 +916,11 @@ fn spawn_animals(
         ..default()
     });
 
-    // Load glTF meshes for animals that use 3D models
+    // Load glTF meshes for animals that use 3D models.
+    // Each model has a GLTF_SCALE chosen so the model's bounding box maps to
+    // a reasonable in-game size, and a GLTF_Y_OFFSET that compensates for
+    // the model's origin not being at ground level (feet).
+    //
     // Squirrel (type 0): full-res model with vertex colors
     //   Bounds: X[-0.625,0.625] Y[-0.724,2.022] Z[-1.206,1.351]
     let squirrel_gltf_mesh: Handle<Mesh> =
@@ -910,39 +949,29 @@ fn spawn_animals(
     // Feet at Y=-0.04, negligible offset
     const DOG_GLTF_Y_OFFSET: f32 = 0.04 * DOG_GLTF_SCALE;
 
-    // Raccoon (type 3): textured model from assets/animals/raccoon.glb
-    //   Bounds: X[-0.83,0.85] Y[-0.05,2.56] Z[-3.58,2.70]
-    //   5290 tris, textured, pre-colored
-    //   Total length ~6.3, target ~0.6 units → scale ~0.1
-    let raccoon_gltf_mesh: Handle<Mesh> =
-        asset_server.load(
-            GltfAssetLabel::Primitive { mesh: 0, primitive: 0 }
-                .from_asset("animals/raccoon.glb"),
-        );
-    let raccoon_gltf_mat: Handle<StandardMaterial> =
-        asset_server.load(
-            GltfAssetLabel::Material { index: 0, is_scale_inverted: false }
-                .from_asset("animals/raccoon.glb"),
-        );
-    const RACCOON_GLTF_SCALE: f32 = 0.18;
-    const RACCOON_GLTF_Y_OFFSET: f32 = 0.05 * RACCOON_GLTF_SCALE;
-
-    // Horse (type 2): textured model from assets/animals/horse.glb
+    // Horse (type 2): animated scene from assets/animals/horse.glb
     //   Bounds: X[-0.26,0.26] Y[-0.004,1.90] Z[-0.70,1.40]
-    //   15363 tris, textured
-    //   Total height ~1.9, target ~1.8 units → scale ~0.95
-    let horse_gltf_mesh: Handle<Mesh> =
-        asset_server.load(
-            GltfAssetLabel::Primitive { mesh: 0, primitive: 0 }
-                .from_asset("animals/horse.glb"),
-        );
-    let horse_gltf_mat: Handle<StandardMaterial> =
-        asset_server.load(
-            GltfAssetLabel::Material { index: 0, is_scale_inverted: false }
-                .from_asset("animals/horse.glb"),
-        );
+    //   Has 1 animation: "Horse_walk"
+    let horse_scene: Handle<Scene> =
+        asset_server.load(GltfAssetLabel::Scene(0).from_asset("animals/horse.glb"));
+    let horse_anim_clip: Handle<AnimationClip> =
+        asset_server.load(GltfAssetLabel::Animation(0).from_asset("animals/horse.glb"));
+    let (horse_graph, horse_walk_node) = AnimationGraph::from_clip(horse_anim_clip);
+    let horse_graph_handle = graphs.add(horse_graph);
     const HORSE_GLTF_SCALE: f32 = 1.8;
     const HORSE_GLTF_Y_OFFSET: f32 = 0.004 * HORSE_GLTF_SCALE;
+
+    // Raccoon (type 3): animated scene from assets/animals/raccoon.glb
+    //   Bounds: X[-0.83,0.85] Y[-0.05,2.56] Z[-3.58,2.70]
+    //   Has 1 animation: "Animation"
+    let raccoon_scene: Handle<Scene> =
+        asset_server.load(GltfAssetLabel::Scene(0).from_asset("animals/raccoon.glb"));
+    let raccoon_anim_clip: Handle<AnimationClip> =
+        asset_server.load(GltfAssetLabel::Animation(0).from_asset("animals/raccoon.glb"));
+    let (raccoon_graph, raccoon_walk_node) = AnimationGraph::from_clip(raccoon_anim_clip);
+    let raccoon_graph_handle = graphs.add(raccoon_graph);
+    const RACCOON_GLTF_SCALE: f32 = 0.18;
+    const RACCOON_GLTF_Y_OFFSET: f32 = 0.05 * RACCOON_GLTF_SCALE;
 
     // Chicken (type 4): textured model from assets/animals/chicken.glb
     //   Bounds: X[-0.88,0.85] Y[-0.03,3.84] Z[-1.95,1.95]
@@ -959,6 +988,19 @@ fn spawn_animals(
         );
     const CHICKEN_GLTF_SCALE: f32 = 0.13;
     const CHICKEN_GLTF_Y_OFFSET: f32 = 0.03 * CHICKEN_GLTF_SCALE;
+
+    // Dinosaur (type 5): animated scene from assets/animals/dinosaur.glb
+    //   Bounds: X[-3.26,-1.66] Y[-0.006,3.13] Z[-8.45,0.48]
+    //   14966 tris, 1 animation: "run", FK skeleton
+    //   Model is offset in X — will be centered by scene. Height ~3.1, make it BIG (~5 blocks tall)
+    let dino_scene: Handle<Scene> =
+        asset_server.load(GltfAssetLabel::Scene(0).from_asset("animals/dinosaur.glb"));
+    let dino_anim_clip: Handle<AnimationClip> =
+        asset_server.load(GltfAssetLabel::Animation(0).from_asset("animals/dinosaur.glb"));
+    let (dino_graph, dino_run_node) = AnimationGraph::from_clip(dino_anim_clip);
+    let dino_graph_handle = graphs.add(dino_graph);
+    const DINO_GLTF_SCALE: f32 = 1.6;
+    const DINO_GLTF_Y_OFFSET: f32 = 0.006 * DINO_GLTF_SCALE;
 
     // Build shared mesh handles per type (procedural)
     let mut body_mesh_handles: Vec<Handle<Mesh>> = Vec::with_capacity(4);
@@ -991,22 +1033,33 @@ fn spawn_animals(
         }));
     }
 
-    let total_animals = 75u32; // 15 each of 5 types
-    let num_types = 5u32;
+    // 75 regular animals (15 per type × 5 types) + 1 dinosaur.
+    // Spawned in a ring around origin at varying distances.
+    // Dinosaur spawns closer (30-80 blocks) to ensure the player encounters it.
+    // Regular animals spread wider (15-180 blocks) to populate the landscape.
+    let regular_animals = 75u32;
+    let num_regular_types = 5u32;
+    let total_animals = regular_animals + 1;
     let mut animal_data: Vec<AnimalData> = Vec::with_capacity(total_animals as usize);
     let mut part_entities: Vec<Entity> = Vec::with_capacity(total_animals as usize * 5);
 
     for i in 0..total_animals {
+        let animal_type = if i < regular_animals { i % num_regular_types } else { 5 }; // 5 = dinosaur
+        let t = animal_type as usize;
+
         let angle = (i as f32) / (total_animals as f32) * PI * 2.0 + rng.gen_range(-0.5_f32..0.5);
-        let dist = rng.gen_range(15.0_f32..180.0);
+        let dist = if animal_type == 5 {
+            rng.gen_range(30.0_f32..80.0) // dinosaur spawns somewhat close
+        } else {
+            rng.gen_range(15.0_f32..180.0)
+        };
         let x = angle.cos() * dist;
         let z = angle.sin() * dist;
         let ground_y = terrain::terrain_height_at(x, z);
-        let animal_type = i % num_types;
-        let t = animal_type as usize;
 
-        // Motion params from TYPE_MOTION (indexed by type)
         let (lo, hi, _) = TYPE_MOTION[t];
+
+        let is_scene = animal_type == 2 || animal_type == 3 || animal_type == 5; // horse + raccoon + dinosaur
 
         animal_data.push(AnimalData {
             position: Vec3::new(x, ground_y, z),
@@ -1016,34 +1069,59 @@ fn spawn_animals(
             animal_type,
             local_time: rng.gen_range(0.0_f32..20.0),
             is_idle: false,
-            is_gltf: true,
+            is_scene,
         });
 
         let animal_idx = i as usize;
 
-        // All animals use glTF models — pick mesh + material + scale per type
-        let (gltf_mesh, gltf_material, gltf_scale): (Handle<Mesh>, Handle<StandardMaterial>, f32) = match animal_type {
-            0 => (squirrel_gltf_mesh.clone(), gltf_vcol_mat.clone(), SQUIRREL_GLTF_SCALE),
-            1 => (dog_gltf_mesh.clone(), dog_gltf_mat.clone(), DOG_GLTF_SCALE),
-            2 => (horse_gltf_mesh.clone(), horse_gltf_mat.clone(), HORSE_GLTF_SCALE),
-            3 => (raccoon_gltf_mesh.clone(), raccoon_gltf_mat.clone(), RACCOON_GLTF_SCALE),
-            4 => (chicken_gltf_mesh.clone(), chicken_gltf_mat.clone(), CHICKEN_GLTF_SCALE),
-            _ => unreachable!(),
-        };
+        if is_scene {
+            // Animated scene-based animal (horse, raccoon)
+            let (scene, gltf_scale) = match animal_type {
+                2 => (horse_scene.clone(), HORSE_GLTF_SCALE),
+                3 => (raccoon_scene.clone(), RACCOON_GLTF_SCALE),
+                5 => (dino_scene.clone(), DINO_GLTF_SCALE),
+                _ => unreachable!(),
+            };
 
-        let body_entity = commands
-            .spawn((
-                AnimalPart {
-                    animal_index: animal_idx,
-                    part_type: AnimalPartType::Body,
-                },
-                Mesh3d(gltf_mesh),
-                MeshMaterial3d(gltf_material),
-                Transform::from_scale(Vec3::splat(gltf_scale)),
-            ))
-            .id();
-        part_entities.push(body_entity);
-        // Placeholder slots for 4 legs (no leg entities for glTF models)
+            let body_entity = commands
+                .spawn((
+                    crate::WorldEntity,
+                    crate::WorldScoped(world_id.0),
+                    AnimatedAnimal { animal_index: animal_idx },
+                    AnimalPart {
+                        animal_index: animal_idx,
+                        part_type: AnimalPartType::Body,
+                    },
+                    SceneRoot(scene),
+                    Transform::from_scale(Vec3::splat(gltf_scale)),
+                ))
+                .id();
+            part_entities.push(body_entity);
+        } else {
+            // Static mesh animal (squirrel, dog, chicken)
+            let (gltf_mesh, gltf_material, gltf_scale): (Handle<Mesh>, Handle<StandardMaterial>, f32) = match animal_type {
+                0 => (squirrel_gltf_mesh.clone(), gltf_vcol_mat.clone(), SQUIRREL_GLTF_SCALE),
+                1 => (dog_gltf_mesh.clone(), dog_gltf_mat.clone(), DOG_GLTF_SCALE),
+                4 => (chicken_gltf_mesh.clone(), chicken_gltf_mat.clone(), CHICKEN_GLTF_SCALE),
+                _ => unreachable!(),
+            };
+
+            let body_entity = commands
+                .spawn((
+                    crate::WorldEntity,
+                    crate::WorldScoped(world_id.0),
+                    AnimalPart {
+                        animal_index: animal_idx,
+                        part_type: AnimalPartType::Body,
+                    },
+                    Mesh3d(gltf_mesh),
+                    MeshMaterial3d(gltf_material),
+                    Transform::from_scale(Vec3::splat(gltf_scale)),
+                ))
+                .id();
+            part_entities.push(body_entity);
+        }
+        // Placeholder slots for 4 legs
         for _ in 0..4 {
             part_entities.push(Entity::PLACEHOLDER);
         }
@@ -1054,25 +1132,95 @@ fn spawn_animals(
         part_entities,
         leg_heights,
     });
+
+    commands.insert_resource(AnimalAnimations {
+        horse: (horse_graph_handle, horse_walk_node),
+        raccoon: (raccoon_graph_handle, raccoon_walk_node),
+        dinosaur: (dino_graph_handle, dino_run_node),
+    });
+}
+
+// ── Animation setup system ─────────────────────────────────────────────
+
+/// When AnimationPlayers appear (after scene loads), attach the graph and start playing.
+fn setup_animal_animations(
+    mut commands: Commands,
+    animations: Option<Res<AnimalAnimations>>,
+    animals: Option<Res<Animals>>,
+    animated_animals: Query<(Entity, &AnimatedAnimal)>,
+    children_query: Query<&Children>,
+    mut players: Query<(Entity, &mut AnimationPlayer), Added<AnimationPlayer>>,
+) {
+    let Some(animations) = animations else { return };
+    let Some(animals) = animals else { return };
+
+    for (player_entity, mut player) in &mut players {
+        // Walk up to find which AnimatedAnimal this player belongs to
+        for (root_entity, animated) in &animated_animals {
+            let is_descendant = children_query
+                .iter_descendants(root_entity)
+                .any(|child| child == player_entity);
+
+            if is_descendant || root_entity == player_entity {
+                let animal_type = animals.data[animated.animal_index].animal_type;
+                let (graph_handle, walk_node) = match animal_type {
+                    2 => (&animations.horse.0, animations.horse.1),
+                    3 => (&animations.raccoon.0, animations.raccoon.1),
+                    5 => (&animations.dinosaur.0, animations.dinosaur.1),
+                    _ => continue,
+                };
+
+                // Attach graph and start walk animation looping
+                commands
+                    .entity(player_entity)
+                    .insert(AnimationGraphHandle(graph_handle.clone()));
+                player.play(walk_node).repeat();
+                break;
+            }
+        }
+    }
 }
 
 // ── Update system ──────────────────────────────────────────────────────
 
-/// Motion parameters per type: (min_speed, max_speed, leg_freq)
-const TYPE_MOTION: [(f32, f32, f32); 5] = [
-    (3.5, 8.0, 10.0),  // squirrel
-    (2.0, 5.5, 6.5),   // dog
-    (3.0, 8.0, 4.5),   // horse
-    (1.2, 3.0, 5.5),   // raccoon
-    (1.5, 4.0, 8.0),   // chicken
+/// Motion parameters per type: (min_speed, max_speed, leg_freq).
+/// Speeds are in blocks/second. leg_freq is the animation cycle rate (Hz).
+///
+/// Tuned relative to player_speed (22.0): most animals are slower than the
+/// player so they can be observed but not threatening. Dinosaurs (type 5)
+/// can match walking speed to create pressure.
+///
+/// WARNING: these should eventually move to DevSettings for runtime tuning.
+/// Currently hardcoded because DevSettings is not yet wired into animal systems.
+const TYPE_MOTION: [(f32, f32, f32); 6] = [
+    (3.5, 8.0, 10.0),  // squirrel — fast, jittery
+    (2.0, 5.5, 6.5),   // dog — medium pace
+    (3.0, 8.0, 4.5),   // horse — moderate speed, slow gait
+    (1.2, 3.0, 5.5),   // raccoon — slow waddle
+    (1.5, 4.0, 8.0),   // chicken — slow body, fast legs
+    (4.0, 10.0, 5.0),  // dinosaur — fast and menacing
 ];
 
 fn update_animals(
     time: Res<Time>,
-    mut animals: ResMut<Animals>,
+    animals: Option<ResMut<Animals>>,
     chunk_manager: Option<Res<ChunkManager>>,
     mut transforms: Query<&mut Transform>,
+    _animated_animals: Query<(Entity, &AnimatedAnimal)>,
+    children_query: Query<&Children>,
+    mut anim_players: Query<&mut AnimationPlayer>,
+    animations: Option<Res<AnimalAnimations>>,
 ) {
+    let Some(mut animals) = animals else {
+        #[cfg(debug_assertions)]
+        {
+            static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                bevy::log::info!("update_animals skipped: Animals resource not yet initialized");
+            }
+        }
+        return;
+    };
     let dt = time.delta_secs();
     let cm = chunk_manager.as_deref();
     let mut rng = rand::thread_rng();
@@ -1103,6 +1251,11 @@ fn update_animals(
             let new_z = data.position.z + data.yaw.cos() * data.speed * dt;
             let ground_y = animal_ground_height(new_x, new_z, cm);
 
+            // Cliff detection: if the ground ahead is >1.2 blocks higher than
+            // current position, the animal turns away. 1.2 is slightly above
+            // 1 full block — animals can step up 1-block ledges but not climb
+            // walls. This also prevents animals from walking off steep cliffs
+            // (the check is one-directional: height *increase* only).
             if ground_y - data.position.y > 1.2 {
                 data.yaw += rng.gen_range(PI * 0.5..PI);
                 data.turn_timer = rng.gen_range(1.0_f32..3.0);
@@ -1116,7 +1269,13 @@ fn update_animals(
     }
 
     // --- Transform update ---
-    // glTF model constants (must match spawn_animals)
+    // glTF model constants — duplicated from spawn_animals because both
+    // systems need them. Scale values are chosen so the model's bounding
+    // box fits the intended in-game size (e.g., squirrel: 2.7 unit model
+    // × 0.18 = ~0.5 blocks tall). Y offsets compensate for models whose
+    // origin isn't at their feet (e.g., dog feet at Y=-0.04 in model space).
+    // WARNING: these are duplicated — changing one without the other will
+    // cause spawn/update mismatch. Should be consolidated into a shared const.
     const SQUIRREL_GLTF_SCALE: f32 = 0.18;
     const SQUIRREL_GLTF_Y_OFFSET: f32 = 0.724 * SQUIRREL_GLTF_SCALE;
     const DOG_GLTF_SCALE: f32 = 0.14;
@@ -1127,19 +1286,16 @@ fn update_animals(
     const RACCOON_GLTF_Y_OFFSET: f32 = 0.05 * RACCOON_GLTF_SCALE;
     const CHICKEN_GLTF_SCALE: f32 = 0.13;
     const CHICKEN_GLTF_Y_OFFSET: f32 = 0.03 * CHICKEN_GLTF_SCALE;
+    const DINO_GLTF_SCALE: f32 = 1.6;
+    const DINO_GLTF_Y_OFFSET: f32 = 0.006 * DINO_GLTF_SCALE;
 
     for (idx, data) in animals.data.iter().enumerate() {
         let t = data.animal_type as usize;
         let (_, _, leg_freq) = TYPE_MOTION[t];
-        let leg_height = if t < animals.leg_heights.len() { animals.leg_heights[t] } else { 0.0 };
 
-        let yaw_rot = Quat::from_rotation_y(data.yaw);
         let is_moving = !data.is_idle;
         let phase = data.local_time * leg_freq;
-        let body_bob = if is_moving { phase.sin() * 0.03 } else { 0.0 };
-
         let ground = data.position.y;
-
         let body_entity = animals.part_entities[idx * 5];
 
         let (gltf_scale, gltf_y_offset, gltf_yaw_offset) = match data.animal_type {
@@ -1148,26 +1304,79 @@ fn update_animals(
             2 => (HORSE_GLTF_SCALE, HORSE_GLTF_Y_OFFSET, 0.0),
             3 => (RACCOON_GLTF_SCALE, RACCOON_GLTF_Y_OFFSET, 0.0),
             4 => (CHICKEN_GLTF_SCALE, CHICKEN_GLTF_Y_OFFSET, 0.0),
+            5 => (DINO_GLTF_SCALE, DINO_GLTF_Y_OFFSET, 0.0),
             _ => unreachable!(),
         };
 
-        // Procedural body animation
-        let body_y = ground + gltf_y_offset + if is_moving { phase.sin() * 0.06 } else { 0.0 };
-        let sway = if is_moving { (phase * 0.5).sin() * 0.04 } else { 0.0 };
-        let lean = if is_moving { -0.08 * (data.speed / 6.0).min(1.0) } else { 0.0 };
-        let roll = if is_moving { (phase * 0.5).cos() * 0.03 } else { 0.0 };
+        if data.is_scene {
+            // Scene-based animated animal: set position/rotation/scale on root,
+            // skeletal animation handles the walk cycle
+            let body_y = ground + gltf_y_offset;
+            if let Ok(mut transform) = transforms.get_mut(body_entity) {
+                *transform = Transform::from_translation(Vec3::new(
+                    data.position.x,
+                    body_y,
+                    data.position.z,
+                ))
+                .with_rotation(Quat::from_rotation_y(data.yaw + gltf_yaw_offset))
+                .with_scale(Vec3::splat(gltf_scale));
+            }
 
-        if let Ok(mut transform) = transforms.get_mut(body_entity) {
-            let body_rot = Quat::from_rotation_y(data.yaw + gltf_yaw_offset + sway)
-                * Quat::from_rotation_x(lean)
-                * Quat::from_rotation_z(roll);
-            *transform = Transform::from_translation(Vec3::new(
-                data.position.x,
-                body_y,
-                data.position.z,
-            ))
-            .with_rotation(body_rot)
-            .with_scale(Vec3::splat(gltf_scale));
+            // Control animation playback speed based on movement
+            if let Some(ref anims) = animations {
+                let walk_node = match data.animal_type {
+                    2 => anims.horse.1,
+                    3 => anims.raccoon.1,
+                    5 => anims.dinosaur.1,
+                    _ => continue,
+                };
+
+                // Find the AnimationPlayer in this scene's descendants
+                for child in children_query.iter_descendants(body_entity) {
+                    if let Ok(mut player) = anim_players.get_mut(child) {
+                        if is_moving {
+                            // Scale animation speed with movement speed.
+                            // 4.0 = reference speed at which animation plays at 1x.
+                            // Clamped to [0.5, 2.0] to prevent unnaturally slow/fast
+                            // animations at extreme speeds.
+                            let speed_factor = (data.speed / 4.0).clamp(0.5, 2.0);
+                            if let Some(anim) = player.animation_mut(walk_node) {
+                                if anim.is_paused() {
+                                    anim.resume();
+                                }
+                                anim.set_speed(speed_factor);
+                            }
+                        } else if let Some(anim) = player.animation_mut(walk_node) {
+                            anim.pause();
+                        }
+                        break;
+                    }
+                }
+            }
+        } else {
+            // Static mesh animal: procedural body animation.
+            // bob (0.06): vertical bounce synced to leg cycle — conveys locomotion
+            // sway (0.04): slow lateral oscillation (half leg freq) — adds weight
+            // lean (-0.08): forward pitch proportional to speed — faster = leaning forward
+            //   capped at speed/6.0 so max lean is -0.08 rad (~4.6°) at 6+ blocks/sec
+            // roll (0.03): slight body roll at half freq — secondary motion for life
+            let body_y = ground + gltf_y_offset + if is_moving { phase.sin() * 0.06 } else { 0.0 };
+            let sway = if is_moving { (phase * 0.5).sin() * 0.04 } else { 0.0 };
+            let lean = if is_moving { -0.08 * (data.speed / 6.0).min(1.0) } else { 0.0 };
+            let roll = if is_moving { (phase * 0.5).cos() * 0.03 } else { 0.0 };
+
+            if let Ok(mut transform) = transforms.get_mut(body_entity) {
+                let body_rot = Quat::from_rotation_y(data.yaw + gltf_yaw_offset + sway)
+                    * Quat::from_rotation_x(lean)
+                    * Quat::from_rotation_z(roll);
+                *transform = Transform::from_translation(Vec3::new(
+                    data.position.x,
+                    body_y,
+                    data.position.z,
+                ))
+                .with_rotation(body_rot)
+                .with_scale(Vec3::splat(gltf_scale));
+            }
         }
     }
 }

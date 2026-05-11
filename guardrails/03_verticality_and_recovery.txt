@@ -1,0 +1,6 @@
+VERTICALITY & RECOVERY
+
+- Max intended fall distances must be defined
+- Recovery paths must always be discoverable
+- Vertical stacks must not create softlocks
+- Downward mistakes cost time, not inevitability

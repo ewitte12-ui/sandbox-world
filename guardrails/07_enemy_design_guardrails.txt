@@ -1,0 +1,6 @@
+ENEMY DESIGN RULES
+
+- Enemies must respect traversal
+- Enemies pressure choices, not execution
+- Recovery paths must remain safe
+- Enemy art must never imply mechanics

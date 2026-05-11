@@ -1,0 +1,5 @@
+GLOBAL TUNING
+
+- Geometry and traversal frozen before tuning
+- Tune difficulty curves across the whole game
+- Stop when changes become subjective

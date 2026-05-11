@@ -1,0 +1,6 @@
+KNOWN RISKS & DEFERRALS
+
+- Voxel edge ambiguity
+- Contact classification becoming load-bearing
+- Camera occlusion edge cases
+- Multiplayer determinism (if added later)

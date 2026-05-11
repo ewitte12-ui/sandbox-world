@@ -1,0 +1,27 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+*.pdb
+
+# macOS
+.DS_Store
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# Claude local settings
+.claude/settings.local.json
+
+# Local backups / snapshots
+/tarket.bak/
+/src.bak/
+/src3-25-2026/
+/src_correctness_baseline/
+/animals/
+
+# Runtime save files
+saves/
+*.save
