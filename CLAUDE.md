@@ -32,6 +32,16 @@ MetalWorld is a Minecraft-style voxel game being ported from Swift/Metal to Bevy
 - All tweakable constants in DevSettings resource, not hardcoded
 - Source port reference: ~/Documents/metalworld/ (Swift version)
 
+## Agent Usage
+
+Delegate work to specialized agents (all running Opus) instead of doing everything in the main thread:
+
+- **Research agent** (when needed): Use for non-trivial codebase exploration, locating symbols across files, or investigating how the Swift source maps to Rust. Skip for trivial single-file reads. Launch via `Agent` with `subagent_type: "Explore"` (read-only) or `"general-purpose"` (broader research). Pass `model: "opus"`.
+- **Critic agent** (whenever anything is changing): Before finalizing any code change — new code, edits, refactors — spawn a critic to review the diff for correctness, regressions, and consistency with the guardrails in `guardrails/` and conventions above. Launch via `Agent` with `subagent_type: "general-purpose"` and `model: "opus"`, briefing it as an independent reviewer.
+- **Coding agent**: For multi-file or non-trivial implementation work, delegate the implementation itself to a coding agent rather than editing in the main thread. Launch via `Agent` with `subagent_type: "general-purpose"` and `model: "opus"`.
+
+All three agents must be invoked with `model: "opus"`. Do not downgrade to Sonnet or Haiku for these roles.
+
 ## File Structure
 
 ```
