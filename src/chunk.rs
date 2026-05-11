@@ -202,6 +202,19 @@ impl Chunk {
         let tiles_per_row = ATLAS_TILES_PER_ROW;
         let tile_uv_size = 1.0 / tiles_per_row as f32;
 
+        // Inset each tile's UV range so the Linear sampler's 2×2 blend
+        // never reaches across a tile boundary into a neighbor block's
+        // pixels. The mip chain is built per-tile (no cumulative bleed
+        // in the mip data itself — see generate_atlas_mip_chain), so
+        // the inset only has to cover one Linear blend at the smallest
+        // mip we actually generate. At min_atlas_size = 32 (each tile
+        // = 4 px), one texel UV = 1/32 ≈ 3.1% of tile_uv_size. A 3%
+        // inset covers the half-texel at every mip from there up, and
+        // the close-up visual loss (≈6% trim across each tile axis) is
+        // imperceptible against the procedural block textures.
+        let uv_inset = tile_uv_size * 0.03;
+        let tile_span = tile_uv_size - 2.0 * uv_inset;
+
         // Helper: emit a single quad into the mesh buffers.
         // `p0..p3` are in padded space (offset by -1 to chunk-local).
         // `w` and `h` are the quad dimensions in blocks (1 for non-greedy).
@@ -227,11 +240,14 @@ impl Chunk {
             for c in &corners {
                 positions.push([c[0] - 1.0, c[1] - 1.0, c[2] - 1.0]);
                 // Tiled UVs: each block-sized cell maps to the full atlas tile.
+                // The inset shrinks the per-tile [0, tile_uv_size] range to
+                // [inset, tile_uv_size - inset] so Linear filtering never
+                // reaches into the neighboring atlas tile.
                 let lu = c[ax_u] - min_u;
                 let lv = c[ax_v] - min_v;
                 uvs.push([
-                    tile_u0 + lu * tile_uv_size,
-                    tile_v0 + lv * tile_uv_size,
+                    tile_u0 + uv_inset + lu * tile_span,
+                    tile_v0 + uv_inset + lv * tile_span,
                 ]);
                 normals.push(normal);
                 colors.push([face_brightness, face_brightness, face_brightness, 1.0]);
@@ -294,7 +310,10 @@ impl Chunk {
                         let lv = if extent_v > 0.01 {
                             (pos[ax_v] - min_pos[ax_v]) / extent_v
                         } else { 0.0 };
-                        uvs.push([tile_u0 + lu * tile_uv_size, tile_v0 + lv * tile_uv_size]);
+                        uvs.push([
+                            tile_u0 + uv_inset + lu * tile_span,
+                            tile_v0 + uv_inset + lv * tile_span,
+                        ]);
                     }
                     for n in face.quad_mesh_normals() { normals.push(n); }
                     for _ in 0..4 {

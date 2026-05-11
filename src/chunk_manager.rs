@@ -97,11 +97,25 @@ impl Default for ChunkManager {
 impl ChunkManager {
     /// Clear all chunk state for a clean Gameplay re-entry.
     /// Called by cleanup_world on entering Menu.
+    ///
+    /// Must reset every field that could leak across a Menu↔Gameplay
+    /// boundary. Missing fields here cause stale block modifications to
+    /// reappear in fresh NewGame sessions, and the symptom is "no
+    /// textures near spawn until I walk far" because previous-session
+    /// edits get baked into the new world via apply_modifications.
     pub fn clear_all(&mut self) {
         self.chunks.clear();
         self.chunk_data.clear();
         self.pending.clear();
         self.dirty_chunks.clear();
+        self.modifications.clear();
+        self.surface_cache.clear();
+
+        // Reset the greedy-meshing kill-switch so a prior session's
+        // tripped invariant doesn't persist into the next Gameplay.
+        #[cfg(debug_assertions)]
+        crate::chunk::GREEDY_INVARIANT_VIOLATED
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Look up the block at a world position, checking modifications first,
@@ -302,7 +316,7 @@ fn setup_chunk_material(
     mut materials: ResMut<Assets<StandardMaterial>>,
     game_settings: Res<crate::settings::GameSettings>,
 ) {
-    use bevy::image::{ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
+    use bevy::image::ImageSampler;
     use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
     let tile_size = game_settings.texture_size.clamp(64, 512);
@@ -392,30 +406,31 @@ fn setup_chunk_material(
         }
     }
 
-    let mut image = Image::new(
+    let (atlas_chain, mip_count) = generate_atlas_mip_chain(data, atlas_size);
+
+    // Construct via new_uninit + manual data assignment: Image::new's
+    // `debug_assert_eq!(size.volume() * pixel_size, data.len())` would
+    // panic in debug builds because our chain is ~4/3× the mip0 byte
+    // length once mipmaps are appended.
+    let mut image = Image::new_uninit(
         Extent3d {
             width: atlas_size,
             height: atlas_size,
             depth_or_array_layers: 1,
         },
         TextureDimension::D2,
-        data,
         TextureFormat::Rgba8UnormSrgb,
         RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
     );
+    image.texture_descriptor.mip_level_count = mip_count;
+    image.data = Some(atlas_chain);
 
-    // Anisotropic filtering: minimum 1 (no aniso) to avoid wgpu validation
-    // errors. Values >1 enable aniso for better texture quality at oblique
-    // angles. Nearest filtering preserves the pixel-art/voxel grid aesthetic.
+    // Nearest mag + Linear min/mipmap: crisp voxel pixels up close, smooth
+    // far-distance sampling that eliminates the sub-pixel texel-flip
+    // shimmer Nearest min-filter produces. Anisotropic filtering needs
+    // mipmaps to do anything, which is why we now generate them above.
     let aniso = game_settings.anisotropic_filtering.max(1);
-    let mut sampler_desc = ImageSamplerDescriptor {
-        mag_filter: ImageFilterMode::Nearest,
-        min_filter: ImageFilterMode::Nearest,
-        ..default()
-    };
-    if aniso > 1 {
-        sampler_desc.set_anisotropic_filter(aniso);
-    }
+    let sampler_desc = make_atlas_sampler_desc(aniso);
     image.sampler = ImageSampler::Descriptor(sampler_desc);
 
     let image_handle = images.add(image);
@@ -568,6 +583,127 @@ pub fn copy_image_to_atlas_tile(atlas_data: &mut [u8], block_idx: u8, rgba: &ima
     }
 }
 
+/// Generate a complete mip chain for the atlas image.
+///
+/// Each mip level is built **per tile**: every mip-N pixel inside a tile
+/// is the average of a `ratio × ratio` block of pixels from that same
+/// tile in mip 0 (where `ratio = base_tile_size / cur_tile_size`). This
+/// matters because the alternative — box-filtering each mip from the
+/// previous mip — averages across tile boundaries at every level and
+/// rapidly contaminates each tile's color with its neighbors. Per-tile
+/// downsampling keeps every tile's pyramid pure; the only neighbor
+/// bleed at runtime comes from the Linear sampler's 2×2 blend at the
+/// outermost texel, which the chunk.rs UV inset covers.
+///
+/// Chain stops when the atlas would drop below `min_atlas_size` (32 px)
+/// or `base_tile_size` is no longer divisible by the next ratio. At
+/// `min_atlas_size = 32`, each tile is 4×4 px — enough to keep distinct
+/// per-block color at the horizon while giving the GPU 4-5 mip levels
+/// of LOD headroom (vs the 1-2 levels the previous cap allowed).
+///
+/// Averaging is in linear color space (the atlas is `Rgba8UnormSrgb`)
+/// to avoid the gamma-darkening artifact of naive sRGB averaging.
+fn generate_atlas_mip_chain(base_data: Vec<u8>, base_size: u32) -> (Vec<u8>, u32) {
+    let min_atlas_size: u32 = 32;
+    let tiles_per_row = ATLAS_TILES_PER_ROW;
+    let base_tile_size = base_size / tiles_per_row;
+    if base_tile_size * tiles_per_row != base_size {
+        // Atlas dimensions don't tile cleanly — refuse to build mips
+        // rather than risk subtly misaligned sampling.
+        return (base_data, 1);
+    }
+
+    let mut chain = base_data;
+    let mut mip_count: u32 = 1;
+
+    // sRGB-to-linear LUT for byte values 0..=255.
+    let mut srgb_to_lin = [0.0f32; 256];
+    for (i, slot) in srgb_to_lin.iter_mut().enumerate() {
+        let c = i as f32 / 255.0;
+        *slot = if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+    }
+
+    let mut ratio: u32 = 2;
+    loop {
+        if base_tile_size % ratio != 0 {
+            break;
+        }
+        let cur_tile_size = base_tile_size / ratio;
+        let cur_atlas_size = cur_tile_size * tiles_per_row;
+        if cur_atlas_size < min_atlas_size {
+            break;
+        }
+
+        let mip_byte_len = (cur_atlas_size * cur_atlas_size * 4) as usize;
+        let mut mip_data = vec![0u8; mip_byte_len];
+        let samples_per_pixel = (ratio * ratio) as f32;
+        let inv_samples = 1.0 / samples_per_pixel;
+
+        for tile_y in 0..tiles_per_row {
+            for tile_x in 0..tiles_per_row {
+                let src_tx = tile_x * base_tile_size;
+                let src_ty = tile_y * base_tile_size;
+                let dst_tx = tile_x * cur_tile_size;
+                let dst_ty = tile_y * cur_tile_size;
+
+                for py in 0..cur_tile_size {
+                    for px in 0..cur_tile_size {
+                        let dst_x = dst_tx + px;
+                        let dst_y = dst_ty + py;
+                        let dst_idx = ((dst_y * cur_atlas_size + dst_x) * 4) as usize;
+
+                        let mut sum_rgb = [0.0f32; 3];
+                        let mut sum_a: u32 = 0;
+                        for sy in 0..ratio {
+                            for sx in 0..ratio {
+                                let src_x = src_tx + px * ratio + sx;
+                                let src_y = src_ty + py * ratio + sy;
+                                let si = ((src_y * base_size + src_x) * 4) as usize;
+                                sum_rgb[0] += srgb_to_lin[chain[si] as usize];
+                                sum_rgb[1] += srgb_to_lin[chain[si + 1] as usize];
+                                sum_rgb[2] += srgb_to_lin[chain[si + 2] as usize];
+                                sum_a += chain[si + 3] as u32;
+                            }
+                        }
+                        for c in 0..3 {
+                            let lin = sum_rgb[c] * inv_samples;
+                            mip_data[dst_idx + c] = (linear_to_srgb(lin) * 255.0).round().clamp(0.0, 255.0) as u8;
+                        }
+                        mip_data[dst_idx + 3] = (sum_a as f32 * inv_samples).round().clamp(0.0, 255.0) as u8;
+                    }
+                }
+            }
+        }
+
+        chain.extend_from_slice(&mip_data);
+        mip_count += 1;
+
+        // Next mip down — only if it's still cleanly divisible.
+        let Some(next_ratio) = ratio.checked_mul(2) else { break };
+        ratio = next_ratio;
+    }
+
+    (chain, mip_count)
+}
+
+/// Build the sampler descriptor used for the block atlas. Mag = Nearest
+/// preserves the crisp pixel look at close range; Min + Mipmap = Linear
+/// kills distance shimmer (sub-pixel texel-flip aliasing) and lets
+/// anisotropic filtering do something useful — aniso requires mipmaps.
+fn make_atlas_sampler_desc(aniso: u16) -> bevy::image::ImageSamplerDescriptor {
+    use bevy::image::{ImageFilterMode, ImageSamplerDescriptor};
+    let mut desc = ImageSamplerDescriptor {
+        mag_filter: ImageFilterMode::Nearest,
+        min_filter: ImageFilterMode::Linear,
+        mipmap_filter: ImageFilterMode::Linear,
+        ..default()
+    };
+    if aniso > 1 {
+        desc.set_anisotropic_filter(aniso);
+    }
+    desc
+}
+
 /// System: check player position and spawn async generation tasks for chunks in range.
 fn load_chunks(
     mut commands: Commands,
@@ -601,6 +737,15 @@ fn load_chunks(
     // Y=10), and chunk Y=-7 starts at block Y=-112 — well below bedrock.
     let y_min = (player_chunk.1 - 2).max(-7);
     let y_max = player_chunk.1 + rd;
+
+    // Collect candidate chunk positions, then sort by chebyshev distance
+    // from the player chunk so chunks nearest the camera are enqueued
+    // FIRST on AsyncComputeTaskPool. Iteration order matters: the pool
+    // grabs tasks in submission order, so a flat row-major sweep would
+    // start with the far corner of the render bubble and leave the
+    // central spawn ground for last. The "hole in the ground at spawn"
+    // symptom is partly that ordering.
+    let mut candidates: Vec<ChunkPos> = Vec::new();
     for cy in y_min..=y_max {
         for cz in (player_chunk.2 - rd)..=(player_chunk.2 + rd) {
             for cx in (player_chunk.0 - rd)..=(player_chunk.0 + rd) {
@@ -608,19 +753,28 @@ fn load_chunks(
                 if manager.chunks.contains_key(&pos) || manager.pending.contains_key(&pos) {
                     continue;
                 }
-
-                let entity = commands.spawn_empty().id();
-                let task = thread_pool.spawn(async move { Chunk::generate(pos) });
-
-                commands.entity(entity).insert(ComputeChunk { pos, task });
-                manager.pending.insert(pos, entity);
-                #[cfg(debug_assertions)]
-                bevy::log::trace!(
-                    "Chunk SPAWN: ({},{},{}) entity={:?} (pending)",
-                    pos.0, pos.1, pos.2, entity,
-                );
+                candidates.push(pos);
             }
         }
+    }
+    candidates.sort_by_key(|p| {
+        let dx = (p.0 - player_chunk.0).abs();
+        let dy = (p.1 - player_chunk.1).abs();
+        let dz = (p.2 - player_chunk.2).abs();
+        dx.max(dy).max(dz)
+    });
+
+    for pos in candidates {
+        let entity = commands.spawn_empty().id();
+        let task = thread_pool.spawn(async move { Chunk::generate(pos) });
+
+        commands.entity(entity).insert(ComputeChunk { pos, task });
+        manager.pending.insert(pos, entity);
+        #[cfg(debug_assertions)]
+        bevy::log::trace!(
+            "Chunk SPAWN: ({},{},{}) entity={:?} (pending)",
+            pos.0, pos.1, pos.2, entity,
+        );
     }
 }
 
@@ -1035,31 +1189,28 @@ fn apply_texture_size_change(
         }
     }
 
-    // Replace the image data in-place
+    // Replace the image data in-place (with regenerated mip chain).
     if let Some(image) = images.get_mut(&atlas.image_handle) {
+        use bevy::image::ImageSampler;
         use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-        *image = Image::new(
+        let (atlas_chain, mip_count) = generate_atlas_mip_chain(data, new_atlas_size);
+        // See note in setup_chunk_material: Image::new would panic on
+        // the chain length vs mip0 extent in debug builds.
+        let mut new_image = Image::new_uninit(
             Extent3d {
                 width: new_atlas_size,
                 height: new_atlas_size,
                 depth_or_array_layers: 1,
             },
             TextureDimension::D2,
-            data,
             TextureFormat::Rgba8UnormSrgb,
             bevy::asset::RenderAssetUsages::MAIN_WORLD | bevy::asset::RenderAssetUsages::RENDER_WORLD,
         );
-        use bevy::image::{ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
+        new_image.texture_descriptor.mip_level_count = mip_count;
+        new_image.data = Some(atlas_chain);
         let aniso = settings.anisotropic_filtering.max(1);
-        let mut sampler_desc = ImageSamplerDescriptor {
-            mag_filter: ImageFilterMode::Nearest,
-            min_filter: ImageFilterMode::Nearest,
-            ..default()
-        };
-        if aniso > 1 {
-            sampler_desc.set_anisotropic_filter(aniso);
-        }
-        image.sampler = ImageSampler::Descriptor(sampler_desc);
+        new_image.sampler = ImageSampler::Descriptor(make_atlas_sampler_desc(aniso));
+        *image = new_image;
     }
 
     atlas.tile_size = new_tile_size;
@@ -1082,16 +1233,8 @@ fn apply_aniso_filter_change(
 
     // Only update sampler, not rebuild the whole atlas
     if let Some(image) = images.get_mut(&atlas.image_handle) {
-        use bevy::image::{ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
+        use bevy::image::ImageSampler;
         let aniso = settings.anisotropic_filtering.max(1);
-        let mut sampler_desc = ImageSamplerDescriptor {
-            mag_filter: ImageFilterMode::Nearest,
-            min_filter: ImageFilterMode::Nearest,
-            ..default()
-        };
-        if aniso > 1 {
-            sampler_desc.set_anisotropic_filter(aniso);
-        }
-        image.sampler = ImageSampler::Descriptor(sampler_desc);
+        image.sampler = ImageSampler::Descriptor(make_atlas_sampler_desc(aniso));
     }
 }

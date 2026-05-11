@@ -225,19 +225,75 @@ fn retry_menu_background(
     }
 }
 
-/// Hide the menu background and menu camera when entering gameplay.
-/// The Player's Camera3d takes over rendering in Gameplay state.
-/// Entities are hidden (not despawned) so they can be re-shown on return.
-fn hide_menu_background(
-    mut bg_query: Query<&mut Visibility, With<MenuBackground>>,
-    mut cam_query: Query<&mut Camera, With<MenuCamera>>,
+/// Ensure a loading overlay (MenuCamera + MenuBackground) is alive when
+/// entering Gameplay, so the user sees the menu background — not a black
+/// screen — while chunks pre-warm and the player Camera3d is still
+/// inactive. `despawn_loading_overlay` tears them down again once
+/// `WorldReady` flips true.
+///
+/// On the first Menu→Gameplay transition the entities already exist from
+/// `open_menu_on_launch` and this function is a no-op. On same-state
+/// Gameplay→Gameplay cycles (Play / Load from the in-game overlay) the
+/// previous Gameplay session's `despawn_loading_overlay` will have
+/// removed them, so we re-spawn fresh here.
+fn ensure_loading_overlay(
+    mut commands: Commands,
+    existing_cams: Query<(), With<MenuCamera>>,
+    existing_bgs: Query<(), With<MenuBackground>>,
+    mut images: ResMut<Assets<Image>>,
+    mut bg_handle: ResMut<MenuBackgroundHandle>,
 ) {
-    for mut vis in &mut bg_query {
-        *vis = Visibility::Hidden;
+    if existing_cams.is_empty() {
+        commands.spawn((
+            crate::UiOnly,
+            MenuCamera,
+            Camera2d,
+            Camera {
+                // Above the player Camera3d (order 0) so the loading
+                // background draws on top while chunks are still loading.
+                order: 100,
+                clear_color: ClearColorConfig::Custom(
+                    Color::linear_rgb(0.02, 0.02, 0.04),
+                ),
+                ..default()
+            },
+        ));
     }
-    for mut cam in &mut cam_query {
-        cam.is_active = false;
+    if existing_bgs.is_empty() {
+        let bg_image = load_menu_background_image(&mut images);
+        bg_handle.handle = bg_image.clone();
+        bg_handle.needs_retry = bg_image.is_none();
+        bg_handle.retry_frames = 0;
+        spawn_menu_background(&mut commands, bg_image);
     }
+}
+
+/// Tear down the loading overlay once the world is ready to render.
+/// Runs every frame in Gameplay; the WorldReady gate makes it a no-op
+/// until check_world_ready has activated the player Camera3d.
+fn despawn_loading_overlay(
+    mut commands: Commands,
+    world_ready: Option<Res<crate::player::WorldReady>>,
+    cam_query: Query<Entity, With<MenuCamera>>,
+    bg_query: Query<Entity, With<MenuBackground>>,
+    mut bg_handle: ResMut<MenuBackgroundHandle>,
+) {
+    let Some(ready) = world_ready else { return };
+    if !ready.0 {
+        return;
+    }
+    if cam_query.is_empty() && bg_query.is_empty() {
+        return;
+    }
+    for entity in &cam_query {
+        commands.entity(entity).despawn();
+    }
+    for entity in &bg_query {
+        commands.entity(entity).despawn();
+    }
+    bg_handle.handle = None;
+    bg_handle.needs_retry = false;
+    bg_handle.retry_frames = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -485,7 +541,8 @@ impl Plugin for UiPlugin {
             .init_resource::<TexturePreviews>()
             .init_resource::<TextureLoadError>()
             .add_systems(OnEnter(GameState::Menu), open_menu_on_launch)
-            .add_systems(OnEnter(GameState::Gameplay), hide_menu_background)
+            .add_systems(OnEnter(GameState::Gameplay), ensure_loading_overlay)
+            .add_systems(Update, despawn_loading_overlay.run_if(in_state(GameState::Gameplay)))
             .add_systems(Update, retry_menu_background.run_if(in_state(GameState::Menu)))
             .add_systems(Update, enforce_cursor_lock)
             .add_systems(Update, window_and_cursor_system)
@@ -533,56 +590,44 @@ fn open_menu_on_launch(
     menu_state.cursor_captured = false;
     menu_state.screen = MenuScreen::MainMenu;
 
-    // Re-show existing menu camera if it was hidden, otherwise spawn fresh.
-    if existing_menu_cams.is_empty() {
-        commands.spawn((
-            crate::UiOnly,
-            MenuCamera,
-            Camera2d,
-            Camera {
-                order: 0,
-                clear_color: ClearColorConfig::Custom(
-                    Color::linear_rgb(0.02, 0.02, 0.04),
-                ),
-                ..default()
-            },
-        ));
-    } else {
-        // Re-activate hidden camera via commands (avoids mutable query conflict).
-        for entity in &existing_menu_cams {
-            commands.entity(entity).insert(Camera {
-                order: 0,
-                is_active: true,
-                clear_color: ClearColorConfig::Custom(
-                    Color::linear_rgb(0.02, 0.02, 0.04),
-                ),
-                ..default()
-            });
-        }
-    }
+    // open_menu_on_launch only fires on OnEnter(GameState::Menu), which
+    // happens exactly once at app startup (the app never transitions
+    // back to Menu after the first Play click). So the queries are
+    // empty by construction. The asserts catch any future regression
+    // that introduces a Gameplay→Menu transition without first
+    // cleaning the loading-overlay entities.
+    debug_assert!(
+        existing_menu_cams.is_empty(),
+        "MenuCamera entity leaked into a fresh Menu entry",
+    );
+    debug_assert!(
+        existing_bgs.is_empty(),
+        "MenuBackground entity leaked into a fresh Menu entry",
+    );
+    let _ = (&existing_menu_cams, &existing_bgs);
 
-    // Re-show existing background if it was hidden, otherwise spawn fresh.
-    if existing_bgs.is_empty() {
-        let bg_image = load_menu_background_image(&mut images);
-        bg_handle.handle = bg_image.clone();
-        bg_handle.needs_retry = bg_image.is_none();
-        bg_handle.retry_frames = 0;
-        spawn_menu_background(&mut commands, bg_image);
-    } else {
-        // Re-show hidden background.
-        for entity in &existing_bgs {
-            commands.entity(entity).insert(Visibility::Inherited);
-        }
-        // Try to load a fresh screenshot (may have been taken on last exit).
-        let bg_image = load_menu_background_image(&mut images);
-        if let Some(handle) = &bg_image {
-            bg_handle.handle = Some(handle.clone());
-            bg_handle.needs_retry = false;
-        } else {
-            bg_handle.needs_retry = true;
-            bg_handle.retry_frames = 0;
-        }
-    }
+    commands.spawn((
+        crate::UiOnly,
+        MenuCamera,
+        Camera2d,
+        Camera {
+            // Order 100 sits well above the player Camera3d (order 0) so
+            // the menu draws on top while it is active, and avoids the
+            // ambiguous render order that resulted from both cameras
+            // sharing order 0 in the previous implementation.
+            order: 100,
+            clear_color: ClearColorConfig::Custom(
+                Color::linear_rgb(0.02, 0.02, 0.04),
+            ),
+            ..default()
+        },
+    ));
+
+    let bg_image = load_menu_background_image(&mut images);
+    bg_handle.handle = bg_image.clone();
+    bg_handle.needs_retry = bg_image.is_none();
+    bg_handle.retry_frames = 0;
+    spawn_menu_background(&mut commands, bg_image);
 
     let is_fullscreen = windows
         .iter()

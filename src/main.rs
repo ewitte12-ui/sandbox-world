@@ -453,6 +453,38 @@ fn cleanup_world(
     *teardown = TeardownIntent::None;
 }
 
+/// Reset ChunkManager and AutoLoadState whenever a teardown is pending,
+/// regardless of which state we end up in next.
+///
+/// WHY this exists in OnExit(Gameplay) instead of OnEnter(Menu):
+/// The "Play" / "Load Game" buttons in the in-game overlay fire
+/// `next_state.set(GameState::Gameplay)` while already in Gameplay.
+/// Bevy treats that as a same-state cycle — OnExit(Gameplay) and
+/// OnEnter(Gameplay) fire, but OnEnter(Menu) does NOT. So the
+/// `cleanup_world` clear that lives on OnEnter(Menu) never runs on
+/// this (extremely common) path, and stale block modifications from
+/// the previous session contaminate the fresh world.
+///
+/// Runs AFTER `auto_save_on_exit` (which reads modifications to disk)
+/// so we never clear before the save is written.
+fn reset_chunk_state_on_teardown(
+    mut chunk_manager: ResMut<chunk_manager::ChunkManager>,
+    mut auto_load: Option<ResMut<save_load::AutoLoadState>>,
+    teardown: Res<TeardownIntent>,
+) {
+    if *teardown == TeardownIntent::None {
+        return;
+    }
+    bevy::log::info!(
+        "reset_chunk_state_on_teardown: intent={:?}, clearing ChunkManager + AutoLoadState",
+        *teardown,
+    );
+    chunk_manager.clear_all();
+    if let Some(al) = auto_load.as_mut() {
+        al.loaded = false;
+    }
+}
+
 /// SAVE SCREENSHOT CONTRACT:
 ///   1. capture_exit_screenshot MUST write the screenshot PNG to disk
 ///      (via Bevy's async save_to_disk observer).
@@ -668,7 +700,11 @@ fn main() {
         // still exists. cleanup_world runs on OnEnter(Menu) — one frame later —
         // so the renderer has time to process the Screenshot entity with the
         // world visible.
-        .add_systems(OnExit(GameState::Gameplay), (auto_save_on_exit, capture_exit_screenshot).chain())
+        .add_systems(OnExit(GameState::Gameplay), (
+            auto_save_on_exit,
+            capture_exit_screenshot,
+            reset_chunk_state_on_teardown,
+        ).chain())
         .add_systems(OnEnter(GameState::Menu), cleanup_world)
         .add_systems(OnEnter(GameState::Gameplay), guard_clean_world_on_entry)
         .init_resource::<TeardownIntent>()

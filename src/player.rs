@@ -123,9 +123,36 @@ fn check_world_ready(
     let chunk_y = (pos.y as i32).div_euclid(crate::chunk::CHUNK_SIZE);
     let chunk_z = (pos.z as i32).div_euclid(crate::chunk::CHUNK_SIZE);
 
-    // Require the player's chunk and immediate neighbors to be loaded.
-    let player_chunk = crate::chunk::ChunkPos(chunk_x, chunk_y, chunk_z);
-    if cm.chunks.contains_key(&player_chunk) {
+    // Require the player's chunk AND the 8 horizontal neighbors to be
+    // meshed before activating the camera. The single-chunk gate that
+    // lived here previously meant adjacent chunks could still be in
+    // flight on AsyncComputeTaskPool when the camera turned on,
+    // producing a visible "hole in the ground at spawn" that filled in
+    // over the next several frames. Jumping appeared to fix it only
+    // because time passed and async tasks completed.
+    let mut all_loaded = true;
+    'outer: for dx in -1..=1 {
+        for dz in -1..=1 {
+            let neighbor = crate::chunk::ChunkPos(chunk_x + dx, chunk_y, chunk_z + dz);
+            if !cm.chunks.contains_key(&neighbor) {
+                all_loaded = false;
+                break 'outer;
+            }
+        }
+    }
+    // Also require the chunk directly below the player so the ground
+    // beneath spawn is meshed before the camera activates. Skip this
+    // check if that chunk is below the bedrock floor (-7) that
+    // load_chunks refuses to enqueue — otherwise the gate would
+    // deadlock for any save whose Y puts the player at chunk_y <= -7.
+    let below_y = chunk_y - 1;
+    let below_loaded = if below_y < -7 {
+        true
+    } else {
+        cm.chunks.contains_key(&crate::chunk::ChunkPos(chunk_x, below_y, chunk_z))
+    };
+
+    if all_loaded && below_loaded {
         // Snap player to solid ground before the first physics frame.
         // Without this, the player spawns at save-file Y (or default Y=20)
         // and free-falls until player_collision catches them.
@@ -134,14 +161,14 @@ fn check_world_ready(
             transform.translation.y = ground;
         }
 
-        // Activate the camera now that the player is grounded.
-        // It was spawned inactive to hide the mid-air spawn position.
+        // Activate the camera now that the player is grounded and the
+        // surrounding ground is fully meshed.
         camera.is_active = true;
 
         ready.0 = true;
         #[cfg(debug_assertions)]
         bevy::log::info!(
-            "World ready — player chunk ({},{},{}) loaded, snapped Y {:.1} → {:.1}",
+            "World ready — player chunk ({},{},{}) + 3x3 neighbors + below loaded, snapped Y {:.1} → {:.1}",
             chunk_x, chunk_y, chunk_z, pos.y, transform.translation.y,
         );
     }
