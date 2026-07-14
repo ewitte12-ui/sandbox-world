@@ -895,6 +895,39 @@ fn animal_ground_height(x: f32, z: f32, cm: Option<&ChunkManager>) -> f32 {
     terrain::terrain_height_at(x, z)
 }
 
+// ── glTF model transforms ──────────────────────────────────────────────
+// Shared by spawn_animals (initial placement) and update_animals
+// (per-frame placement) — a single definition so the two can't drift.
+// Scale maps each model's bounding box to its intended in-game size;
+// Y offset compensates for models whose origin isn't at their feet
+// (bounds are documented at each model's load site in spawn_animals).
+
+const SQUIRREL_GLTF_SCALE: f32 = 0.18;
+const SQUIRREL_GLTF_Y_OFFSET: f32 = 0.724 * SQUIRREL_GLTF_SCALE;
+const DOG_GLTF_SCALE: f32 = 0.14;
+const DOG_GLTF_Y_OFFSET: f32 = 0.04 * DOG_GLTF_SCALE;
+const HORSE_GLTF_SCALE: f32 = 1.8;
+const HORSE_GLTF_Y_OFFSET: f32 = 0.004 * HORSE_GLTF_SCALE;
+const RACCOON_GLTF_SCALE: f32 = 0.18;
+const RACCOON_GLTF_Y_OFFSET: f32 = 0.05 * RACCOON_GLTF_SCALE;
+const CHICKEN_GLTF_SCALE: f32 = 0.13;
+const CHICKEN_GLTF_Y_OFFSET: f32 = 0.03 * CHICKEN_GLTF_SCALE;
+const DINO_GLTF_SCALE: f32 = 1.6;
+const DINO_GLTF_Y_OFFSET: f32 = 0.006 * DINO_GLTF_SCALE;
+
+/// (scale, y_offset, yaw_offset) for an animal type index.
+fn gltf_transform_for(animal_type: u32) -> (f32, f32, f32) {
+    match animal_type {
+        0 => (SQUIRREL_GLTF_SCALE, SQUIRREL_GLTF_Y_OFFSET, 0.0),
+        1 => (DOG_GLTF_SCALE, DOG_GLTF_Y_OFFSET, 0.0),
+        2 => (HORSE_GLTF_SCALE, HORSE_GLTF_Y_OFFSET, 0.0),
+        3 => (RACCOON_GLTF_SCALE, RACCOON_GLTF_Y_OFFSET, 0.0),
+        4 => (CHICKEN_GLTF_SCALE, CHICKEN_GLTF_Y_OFFSET, 0.0),
+        5 => (DINO_GLTF_SCALE, DINO_GLTF_Y_OFFSET, 0.0),
+        _ => unreachable!("unknown animal type {animal_type}"),
+    }
+}
+
 // ── Startup system ─────────────────────────────────────────────────────
 
 fn spawn_animals(
@@ -928,8 +961,6 @@ fn spawn_animals(
             GltfAssetLabel::Primitive { mesh: 0, primitive: 0 }
                 .from_asset("animals/squirrel.glb"),
         );
-    const SQUIRREL_GLTF_SCALE: f32 = 0.18;
-    const SQUIRREL_GLTF_Y_OFFSET: f32 = 0.724 * SQUIRREL_GLTF_SCALE;
 
     // Dog (type 1): textured model from assets/animals/dog.glb
     //   Bounds: X[-1.17,1.17] Y[-0.04,5.46] Z[-5.14,4.88]
@@ -945,9 +976,6 @@ fn spawn_animals(
             GltfAssetLabel::Material { index: 0, is_scale_inverted: false }
                 .from_asset("animals/dog.glb"),
         );
-    const DOG_GLTF_SCALE: f32 = 0.14;
-    // Feet at Y=-0.04, negligible offset
-    const DOG_GLTF_Y_OFFSET: f32 = 0.04 * DOG_GLTF_SCALE;
 
     // Horse (type 2): animated scene from assets/animals/horse.glb
     //   Bounds: X[-0.26,0.26] Y[-0.004,1.90] Z[-0.70,1.40]
@@ -958,8 +986,6 @@ fn spawn_animals(
         asset_server.load(GltfAssetLabel::Animation(0).from_asset("animals/horse.glb"));
     let (horse_graph, horse_walk_node) = AnimationGraph::from_clip(horse_anim_clip);
     let horse_graph_handle = graphs.add(horse_graph);
-    const HORSE_GLTF_SCALE: f32 = 1.8;
-    const HORSE_GLTF_Y_OFFSET: f32 = 0.004 * HORSE_GLTF_SCALE;
 
     // Raccoon (type 3): animated scene from assets/animals/raccoon.glb
     //   Bounds: X[-0.83,0.85] Y[-0.05,2.56] Z[-3.58,2.70]
@@ -970,8 +996,6 @@ fn spawn_animals(
         asset_server.load(GltfAssetLabel::Animation(0).from_asset("animals/raccoon.glb"));
     let (raccoon_graph, raccoon_walk_node) = AnimationGraph::from_clip(raccoon_anim_clip);
     let raccoon_graph_handle = graphs.add(raccoon_graph);
-    const RACCOON_GLTF_SCALE: f32 = 0.18;
-    const RACCOON_GLTF_Y_OFFSET: f32 = 0.05 * RACCOON_GLTF_SCALE;
 
     // Chicken (type 4): textured model from assets/animals/chicken.glb
     //   Bounds: X[-0.88,0.85] Y[-0.03,3.84] Z[-1.95,1.95]
@@ -986,8 +1010,6 @@ fn spawn_animals(
             GltfAssetLabel::Material { index: 0, is_scale_inverted: false }
                 .from_asset("animals/chicken.glb"),
         );
-    const CHICKEN_GLTF_SCALE: f32 = 0.13;
-    const CHICKEN_GLTF_Y_OFFSET: f32 = 0.03 * CHICKEN_GLTF_SCALE;
 
     // Dinosaur (type 5): animated scene from assets/animals/dinosaur.glb
     //   Bounds: X[-3.26,-1.66] Y[-0.006,3.13] Z[-8.45,0.48]
@@ -999,8 +1021,6 @@ fn spawn_animals(
         asset_server.load(GltfAssetLabel::Animation(0).from_asset("animals/dinosaur.glb"));
     let (dino_graph, dino_run_node) = AnimationGraph::from_clip(dino_anim_clip);
     let dino_graph_handle = graphs.add(dino_graph);
-    const DINO_GLTF_SCALE: f32 = 1.6;
-    const DINO_GLTF_Y_OFFSET: f32 = 0.006 * DINO_GLTF_SCALE;
 
     // Build shared mesh handles per type (procedural)
     let mut body_mesh_handles: Vec<Handle<Mesh>> = Vec::with_capacity(4);
@@ -1269,25 +1289,6 @@ fn update_animals(
     }
 
     // --- Transform update ---
-    // glTF model constants — duplicated from spawn_animals because both
-    // systems need them. Scale values are chosen so the model's bounding
-    // box fits the intended in-game size (e.g., squirrel: 2.7 unit model
-    // × 0.18 = ~0.5 blocks tall). Y offsets compensate for models whose
-    // origin isn't at their feet (e.g., dog feet at Y=-0.04 in model space).
-    // WARNING: these are duplicated — changing one without the other will
-    // cause spawn/update mismatch. Should be consolidated into a shared const.
-    const SQUIRREL_GLTF_SCALE: f32 = 0.18;
-    const SQUIRREL_GLTF_Y_OFFSET: f32 = 0.724 * SQUIRREL_GLTF_SCALE;
-    const DOG_GLTF_SCALE: f32 = 0.14;
-    const DOG_GLTF_Y_OFFSET: f32 = 0.04 * DOG_GLTF_SCALE;
-    const HORSE_GLTF_SCALE: f32 = 1.8;
-    const HORSE_GLTF_Y_OFFSET: f32 = 0.004 * HORSE_GLTF_SCALE;
-    const RACCOON_GLTF_SCALE: f32 = 0.18;
-    const RACCOON_GLTF_Y_OFFSET: f32 = 0.05 * RACCOON_GLTF_SCALE;
-    const CHICKEN_GLTF_SCALE: f32 = 0.13;
-    const CHICKEN_GLTF_Y_OFFSET: f32 = 0.03 * CHICKEN_GLTF_SCALE;
-    const DINO_GLTF_SCALE: f32 = 1.6;
-    const DINO_GLTF_Y_OFFSET: f32 = 0.006 * DINO_GLTF_SCALE;
 
     for (idx, data) in animals.data.iter().enumerate() {
         let t = data.animal_type as usize;
@@ -1298,15 +1299,8 @@ fn update_animals(
         let ground = data.position.y;
         let body_entity = animals.part_entities[idx * 5];
 
-        let (gltf_scale, gltf_y_offset, gltf_yaw_offset) = match data.animal_type {
-            0 => (SQUIRREL_GLTF_SCALE, SQUIRREL_GLTF_Y_OFFSET, 0.0),
-            1 => (DOG_GLTF_SCALE, DOG_GLTF_Y_OFFSET, 0.0),
-            2 => (HORSE_GLTF_SCALE, HORSE_GLTF_Y_OFFSET, 0.0),
-            3 => (RACCOON_GLTF_SCALE, RACCOON_GLTF_Y_OFFSET, 0.0),
-            4 => (CHICKEN_GLTF_SCALE, CHICKEN_GLTF_Y_OFFSET, 0.0),
-            5 => (DINO_GLTF_SCALE, DINO_GLTF_Y_OFFSET, 0.0),
-            _ => unreachable!(),
-        };
+        let (gltf_scale, gltf_y_offset, gltf_yaw_offset) =
+            gltf_transform_for(data.animal_type);
 
         if data.is_scene {
             // Scene-based animated animal: set position/rotation/scale on root,

@@ -14,6 +14,9 @@ mod settings;
 mod sky;
 mod terrain;
 mod ui;
+// NOTE: entity-based trees (formerly trees.rs) were removed — they were
+// never registered as a plugin, and the live trees are voxel blocks baked
+// into chunks by terrain::place_trees_in_chunk.
 
 /// Top-level application state. The game launches into Menu; gameplay begins
 /// only when the player explicitly starts or loads a game.
@@ -191,6 +194,49 @@ pub struct PendingTeardown {
     pub kind: TeardownIntent,
 }
 
+/// Deferred Play/Load state transition.
+///
+/// WHY: the exit screenshot must capture the world with the menu already
+/// closed and the world still alive. On the old immediate-transition path,
+/// OnExit(Gameplay) requested the screenshot in the same frame that
+/// OnEnter(Gameplay)'s teardown despawned every world entity — both run in
+/// the same StateTransition schedule, so the captured frame showed a dead
+/// world (black / stale menu background). That was the visible
+/// "menu-reload texture loss".
+///
+/// Flow: the Play/Load handlers close the menu, request the screenshot
+/// (world renders clean for a frame or two), and set this countdown.
+/// `process_pending_reload` fires the real transition when it reaches zero.
+#[derive(Resource, Default)]
+pub struct PendingReload {
+    pub active: bool,
+    pub frames: u8,
+}
+
+/// Number of frames to keep the world alive (menu closed) before the
+/// reload transition, so the screenshot capture sees a fully rendered
+/// world frame regardless of which frame the renderer grabs.
+pub const RELOAD_DEFER_FRAMES: u8 = 2;
+
+/// Counts down PendingReload and fires the deferred Gameplay transition.
+/// Runs in all states: Play/Load can be triggered from the title menu
+/// (Menu state) and from the in-game overlay (Gameplay state).
+fn process_pending_reload(
+    mut pending: ResMut<PendingReload>,
+    mut next_state: ResMut<NextState<GameState>>,
+) {
+    if !pending.active {
+        return;
+    }
+    if pending.frames > 0 {
+        pending.frames -= 1;
+        return;
+    }
+    pending.active = false;
+    bevy::log::info!("PendingReload countdown complete — entering Gameplay");
+    next_state.set(GameState::Gameplay);
+}
+
 /// Explicit request to initialize (or reinitialize) the game world.
 /// Separates "teardown completed" from "please build a new world now."
 ///
@@ -333,6 +379,7 @@ fn guard_clean_world_on_entry(
     mut teardown: ResMut<TeardownIntent>,
     pending_teardown: Res<PendingTeardown>,
     mut plate_count: ResMut<BackgroundPlateCount>,
+    mut world_ready: ResMut<player::WorldReady>,
 ) {
     let old_id = pending_teardown.old_id;
     let stale: Vec<Entity> = scoped_entities
@@ -364,6 +411,14 @@ fn guard_clean_world_on_entry(
         // No TeardownIssued emitted → fence will never start waiting.
         return;
     }
+
+    // Reset world readiness IMMEDIATELY (in StateTransition, before this
+    // frame's Update runs). The old session's WorldReady=true otherwise
+    // survives until the fence-gated reset_world_ready runs 1-2 frames
+    // later, during which despawn_loading_overlay sees stale `true` and
+    // kills the loading overlay that ensure_loading_overlay just spawned —
+    // the black-screen flash during chunk pre-warm.
+    world_ready.0 = false;
 
     if count > 0 {
         // Reset plate count so the snapshot system re-captures after respawn.
@@ -486,78 +541,56 @@ fn reset_chunk_state_on_teardown(
 }
 
 /// SAVE SCREENSHOT CONTRACT:
-///   1. capture_exit_screenshot MUST write the screenshot PNG to disk
+///   1. request_menu_screenshot MUST write the screenshot PNG to disk
 ///      (via Bevy's async save_to_disk observer).
-///   2. capture_exit_screenshot MUST persist the PNG path into save
+///   2. request_menu_screenshot MUST persist the PNG path into save
 ///      metadata (via update_save_screenshot_path) BEFORE the screenshot
 ///      is captured, so the path exists even if the async write is delayed.
 ///   3. Menu background loading depends ONLY on save metadata — it reads
 ///      last_menu_background_image_path from the JSON, never guesses paths.
 ///   4. The screenshot file is optional (may not exist yet on first launch).
 ///      The Menu falls back to a solid dark panel if the file is missing.
-///      But the contract (write + persist path) is mandatory whenever a
-///      Gameplay→Menu transition occurs.
+///   5. TIMING: the capture is requested at reload-initiation time (Play /
+///      Load click), on the frame the menu UI is despawned and BEFORE the
+///      deferred state transition tears the world down (see PendingReload).
+///      It must NOT be requested from OnExit(Gameplay): on the same-state
+///      Gameplay→Gameplay reload cycle, OnEnter's teardown despawns the
+///      world in the same StateTransition schedule, so an OnExit capture
+///      renders a dead world.
 ///
-/// Capture a screenshot of the world on the last frame of Gameplay.
-/// Runs on OnExit(Gameplay) while the world camera and entities still exist.
-/// The actual render capture happens in the same frame's render phase,
-/// before cleanup_world despawns everything on OnEnter(Menu).
 /// Auto-save the game when exiting Gameplay. Ensures that all in-memory
 /// state (block modifications, player position) is persisted before
-/// cleanup_world discards it. This prevents data loss on Gameplay→Menu
-/// transitions. The save file is then the single source of truth for
-/// the next Gameplay entry.
+/// teardown discards it. This prevents data loss on reload transitions.
+/// The save file is then the single source of truth for the next
+/// Gameplay entry. Skipped for LoadGame teardowns (see body).
 fn auto_save_on_exit(
     chunk_manager: Option<Res<chunk_manager::ChunkManager>>,
     player_query: Query<(&Transform, &player::Player)>,
+    teardown: Res<TeardownIntent>,
 ) {
+    // Loading a save must NOT auto-save the abandoned session: the load flow
+    // has already staged the chosen save file at the default path for
+    // spawn_player / auto_load_game to consume, and writing the old
+    // session's state here would overwrite it with exactly the data the
+    // user is trying to replace.
+    if *teardown == TeardownIntent::LoadGame {
+        bevy::log::info!("Auto-save skipped: LoadGame teardown (staged save preserved)");
+        return;
+    }
+
     let Some(cm) = chunk_manager.as_deref() else { return };
-    let Some((transform, player)) = player_query.iter().next() else { return };
 
-    // Build save data from current in-memory state.
-    let save_path = dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".metalworld_save.json");
-    let screenshot_path = save_path.with_extension("png");
-
-    #[derive(serde::Serialize)]
-    struct BlockMod { x: i32, y: i32, z: i32, block_type: u8 }
-
-    #[derive(serde::Serialize)]
-    struct QuickSave {
-        player_position: [f32; 3],
-        player_yaw: f32,
-        player_pitch: f32,
-        home_position: Option<[f32; 3]>,
-        modifications: Vec<BlockMod>,
-        last_menu_background_image_path: Option<String>,
-    }
-
-    let mods: Vec<_> = cm.modifications.iter()
-        .map(|(pos, &block)| BlockMod { x: pos.x, y: pos.y, z: pos.z, block_type: block.index() })
-        .collect();
-
-    let save = QuickSave {
-        player_position: transform.translation.to_array(),
-        player_yaw: player.yaw,
-        player_pitch: player.pitch,
-        home_position: player.home_position.map(|p| p.to_array()),
-        modifications: mods,
-        last_menu_background_image_path: Some(screenshot_path.to_string_lossy().into_owned()),
-    };
-
-    if let Ok(data) = serde_json::to_string_pretty(&save) {
-        match std::fs::write(&save_path, &data) {
-            Ok(()) => {
-                #[cfg(debug_assertions)]
-                bevy::log::info!("Auto-saved on exit: {} modifications", save.modifications.len());
-            }
-            Err(e) => bevy::log::warn!("Auto-save failed: {}", e),
-        }
-    }
+    // Delegate to the single schema owner in save_load.rs — do NOT
+    // hand-roll a serializer here (a private copy of the schema is how the
+    // menu-background path got silently dropped from quit-saves).
+    save_load::write_quick_save(cm, &player_query);
 }
 
-fn capture_exit_screenshot(mut commands: Commands) {
+/// Request the menu-background screenshot of the current window contents.
+/// Called by the Play/Load handlers on the click frame — the menu UI is
+/// despawned in the same command batch, and the PendingReload deferral
+/// keeps the world alive for the frames the renderer needs to capture it.
+pub fn request_menu_screenshot(commands: &mut Commands) {
     use bevy::render::view::screenshot::{save_to_disk, Screenshot};
     let save_json_path = dirs::home_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -565,7 +598,7 @@ fn capture_exit_screenshot(mut commands: Commands) {
     let screenshot_path = save_json_path.with_extension("png");
 
     #[cfg(debug_assertions)]
-    bevy::log::info!("Capturing exit screenshot → {}", screenshot_path.display());
+    bevy::log::info!("Capturing menu screenshot → {}", screenshot_path.display());
 
     // Update the save metadata with the screenshot path so the Menu can find it.
     // Read-modify-write: preserve all existing fields, inject/overwrite the path.
@@ -696,13 +729,11 @@ fn main() {
             ..default()
         }))
         .init_state::<GameState>()
-        // Screenshot is captured on OnExit(Gameplay) while the world camera
-        // still exists. cleanup_world runs on OnEnter(Menu) — one frame later —
-        // so the renderer has time to process the Screenshot entity with the
-        // world visible.
+        // The menu-background screenshot is requested by the Play/Load
+        // handlers at click time (world alive, menu just despawned) — NOT
+        // here. See PendingReload / request_menu_screenshot.
         .add_systems(OnExit(GameState::Gameplay), (
             auto_save_on_exit,
-            capture_exit_screenshot,
             reset_chunk_state_on_teardown,
         ).chain())
         .add_systems(OnEnter(GameState::Menu), cleanup_world)
@@ -712,6 +743,8 @@ fn main() {
         .init_resource::<PendingTeardown>()
         .init_resource::<TeardownPendingVerification>()
         .init_resource::<WorldInitPending>()
+        .init_resource::<PendingReload>()
+        .add_systems(Update, process_pending_reload)
         .add_observer(on_teardown_issued)
         .add_observer(on_world_init_requested)
         .add_systems(Update, verify_teardown_complete.run_if(in_state(GameState::Gameplay)))

@@ -104,6 +104,15 @@ fn world_ready(ready: Option<Res<WorldReady>>) -> bool {
     ready.map(|r| r.0).unwrap_or(false)
 }
 
+/// Run condition: false while a Play/Load reload countdown is active.
+/// During the deferral the menu is closed and the cursor is grabbed, so
+/// without this gate a mouse button still held from the menu click would
+/// reach block_interact and edit the world right before it is torn down
+/// (and right before the menu-background screenshot is captured).
+fn reload_not_pending(pending: Res<crate::PendingReload>) -> bool {
+    !pending.active
+}
+
 /// System: check if chunks near the player are loaded and mark world as ready.
 fn check_world_ready(
     mut ready: ResMut<WorldReady>,
@@ -483,7 +492,8 @@ impl Plugin for PlayerPlugin {
                     .run_if(not(resource_exists::<FileDialogOpen>))
                     .run_if(menu_closed)
                     .run_if(inventory_closed)
-                    .run_if(world_ready),
+                    .run_if(world_ready)
+                    .run_if(reload_not_pending),
             );
     }
 }

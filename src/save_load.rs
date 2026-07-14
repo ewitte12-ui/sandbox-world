@@ -273,6 +273,43 @@ fn apply_save_data(
     }
 }
 
+/// Write the quick-save (default path) from current in-memory state.
+///
+/// SINGLE SOURCE OF TRUTH for the save schema: main.rs auto_save_on_exit
+/// and the ui.rs quit handlers call this instead of hand-rolling their own
+/// serializer structs. (Historical bug this prevents: ui.rs's private copy
+/// of the schema lacked last_menu_background_image_path, so quitting from
+/// the menu silently dropped the screenshot path and the next launch lost
+/// its menu background.)
+///
+/// Returns true if the file was written.
+pub fn write_quick_save(
+    cm: &ChunkManager,
+    player_query: &Query<(&Transform, &Player)>,
+) -> bool {
+    let path = save_path();
+    let Some(save) = collect_save_data(cm, player_query, &path) else {
+        warn!("Quick-save skipped: no player entity.");
+        return false;
+    };
+    match serde_json::to_string_pretty(&save) {
+        Ok(data) => match std::fs::write(&path, data) {
+            Ok(()) => {
+                info!("Saved {} modifications to {}", save.modifications.len(), path.display());
+                true
+            }
+            Err(e) => {
+                warn!("Quick-save write failed ({}): {}", path.display(), e);
+                false
+            }
+        },
+        Err(e) => {
+            warn!("Quick-save serialization failed: {}", e);
+            false
+        }
+    }
+}
+
 /// Quick-save when F5 is pressed — writes to the default save path.
 /// This is an internal gameplay shortcut, not a user-initiated menu action.
 fn save_game_on_key(
@@ -288,13 +325,8 @@ fn save_game_on_key(
     let Some(cm) = chunk_manager.as_deref() else {
         return;
     };
-    let path = save_path();
-    let Some(save) = collect_save_data(cm, &player_query, &path) else {
-        return;
-    };
-    if let Ok(data) = serde_json::to_string_pretty(&save) {
-        let _ = std::fs::write(&path, data);
-        request_screenshot(&mut commands, &path);
+    if write_quick_save(cm, &player_query) {
+        request_screenshot(&mut commands, &save_path());
         info!("Game saved!");
     }
 }
@@ -338,17 +370,30 @@ fn open_file_dialog(
     commands.insert_resource(FileDialogOpen);
 }
 
-/// Polls a running file dialog task. When the user selects a file, loads
-/// save data from that path, closes the menu, grabs the cursor, and
-/// transitions to Gameplay. If the user cancels, nothing changes.
+/// Polls a running file dialog task. When the user selects a file, stages
+/// the save at the default path and schedules a LoadGame reload through the
+/// SAME teardown/init machinery the Play button uses. If the user cancels,
+/// nothing changes.
+///
+/// WHY the full teardown wiring: without setting TeardownIntent and bumping
+/// WorldInstanceId, guard_clean_world_on_entry never emits TeardownIssued,
+/// the fence never triggers WorldInitRequested, and the WorldSpawnSet
+/// systems (player, sun, sky, animals) never run. From the title menu that
+/// was a permanent hang on the loading screen; from the in-game overlay it
+/// merged the loaded save's modifications into the live world instead of
+/// replacing it.
 fn poll_file_dialog(
     mut commands: Commands,
     mut dialog: Option<ResMut<FileDialogTask>>,
-    mut chunk_manager: ResMut<ChunkManager>,
-    mut next_state: ResMut<NextState<GameState>>,
     mut menu_state: ResMut<crate::ui::MenuState>,
     menu_query: Query<Entity, With<crate::ui::SettingsMenu>>,
     mut cursor_query: Query<&mut bevy::window::CursorOptions, With<bevy::window::PrimaryWindow>>,
+    state: Res<State<GameState>>,
+    mut start_mode: ResMut<StartMode>,
+    mut teardown_intent: ResMut<crate::TeardownIntent>,
+    mut world_instance: ResMut<crate::WorldInstanceId>,
+    mut pending_teardown: ResMut<crate::PendingTeardown>,
+    mut pending_reload: ResMut<crate::PendingReload>,
 ) {
     let Some(ref mut dialog) = dialog else {
         return;
@@ -367,10 +412,27 @@ fn poll_file_dialog(
         return; // user cancelled
     };
 
-    info!("Loading save from: {}", path.display());
-    apply_save_data_from_path(&path, &mut chunk_manager);
+    // Validate and stage the chosen file. On failure the current session
+    // continues untouched — no teardown is scheduled.
+    if !stage_save_file(&path) {
+        return;
+    }
 
-    // Close menu and enter gameplay
+    // Route through the standard teardown/rebuild machinery (mirrors the
+    // Play button). auto_save_on_exit skips the LoadGame intent so it can't
+    // overwrite the staged file; reset_chunk_state_on_teardown clears the
+    // old world's modifications; spawn_player + auto_load_game then restore
+    // everything from the staged default save.
+    *start_mode = StartMode::Continue;
+    let old_id = world_instance.0;
+    world_instance.0 = old_id + 1;
+    *pending_teardown = crate::PendingTeardown {
+        old_id,
+        kind: crate::TeardownIntent::LoadGame,
+    };
+    *teardown_intent = crate::TeardownIntent::LoadGame;
+
+    // Close menu, grab cursor, and defer the transition (see PendingReload).
     menu_state.is_open = false;
     for entity in &menu_query {
         commands.entity(entity).despawn();
@@ -380,47 +442,59 @@ fn poll_file_dialog(
         cursor.visible = false;
         menu_state.cursor_captured = true;
     }
-    next_state.set(GameState::Gameplay);
+    // Screenshot only when a live world exists (in-game overlay path).
+    if *state.get() == GameState::Gameplay {
+        crate::request_menu_screenshot(&mut commands);
+    }
+    *pending_reload = crate::PendingReload {
+        active: true,
+        frames: crate::RELOAD_DEFER_FRAMES,
+    };
 }
 
-/// Load save data from an arbitrary path (used by file dialog).
-fn apply_save_data_from_path(
-    path: &std::path::Path,
-    chunk_manager: &mut ResMut<ChunkManager>,
-) {
+/// Validate a user-chosen save file and stage it at the default save path,
+/// where spawn_player (load_player_from_save) and auto_load_game read it
+/// during world init. Returns false if the file can't be read, parsed, or
+/// copied — the caller must then abort the load.
+///
+/// Modifications are NOT applied here: auto_load_game applies them from the
+/// staged file after the world rebuild, which also runs them through the
+/// save-corruption guard in apply_save_data.
+fn stage_save_file(path: &std::path::Path) -> bool {
     let data = match std::fs::read_to_string(path) {
         Ok(d) => d,
         Err(e) => {
             warn!("Failed to read save file {}: {}", path.display(), e);
-            return;
+            return false;
         }
     };
     let save: SaveData = match serde_json::from_str(&data) {
         Ok(s) => s,
         Err(e) => {
             warn!("Failed to parse save file {}: {}", path.display(), e);
-            return;
+            return false;
         }
     };
 
-    for m in &save.modifications {
-        let block = BlockType::from_u8(m.block_type);
-        let pos = IVec3::new(m.x, m.y, m.z);
-        chunk_manager.set_block(pos, block);
-    }
-
-    // Copy loaded save to the default save path so spawn_player (which runs
-    // on OnEnter(Gameplay)) restores position from the correct file.
     let default_path = save_path();
     if path != default_path {
-        let _ = std::fs::copy(path, &default_path);
+        if let Err(e) = std::fs::copy(path, &default_path) {
+            warn!(
+                "Failed to stage save file {} → {}: {}",
+                path.display(),
+                default_path.display(),
+                e,
+            );
+            return false;
+        }
     }
 
     info!(
-        "Loaded save from {}: {} modifications",
+        "Staged save from {}: {} modifications",
         path.display(),
         save.modifications.len()
     );
+    true
 }
 
 /// Build a SaveData snapshot from the current game state.

@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::block_types::BlockType;
 use crate::chunk_manager::{ATLAS_TILES_PER_ROW};
-use crate::terrain::{natural_block_at, place_trees_in_chunk};
+use crate::terrain::place_trees_in_chunk;
 
 /// Debug: set to true by build_mesh if a greedy meshing invariant is violated.
 /// Checked by chunk_manager systems to auto-disable greedy meshing.
@@ -60,25 +60,40 @@ impl Chunk {
 
     /// Generate a chunk by filling blocks from terrain generation.
     pub fn generate(pos: ChunkPos) -> Self {
+        Self::generate_tracked(pos).0
+    }
+
+    /// Generate a chunk and report which of its boundary layers contain
+    /// non-terrain content (tree blocks), in ChunkNeighbors face order
+    /// (-X, +X, -Y, +Y, -Z, +Z). Neighbors already meshed against
+    /// terrain-predicted padding (see build_mesh) only need a remesh when
+    /// the corresponding bit is set — this is what keeps the neighbor-load
+    /// remesh pass from becoming a remesh-everything storm.
+    pub fn generate_tracked(pos: ChunkPos) -> (Self, [bool; 6]) {
         let mut blocks = [BlockType::AIR; CHUNK_VOLUME];
         let base_x = pos.0 * CHUNK_SIZE;
         let base_y = pos.1 * CHUNK_SIZE;
         let base_z = pos.2 * CHUNK_SIZE;
 
+        // Surface height depends only on the (x, z) column — compute each
+        // column once instead of once per block (16× fewer FBM evaluations
+        // per chunk). Produces byte-identical terrain to the per-block path.
         for z in 0..CHUNK_SIZE {
-            for y in 0..CHUNK_SIZE {
-                for x in 0..CHUNK_SIZE {
-                    let wx = base_x + x;
+            for x in 0..CHUNK_SIZE {
+                let wx = base_x + x;
+                let wz = base_z + z;
+                let sy = crate::terrain::surface_y(wx, wz);
+                for y in 0..CHUNK_SIZE {
                     let wy = base_y + y;
-                    let wz = base_z + z;
-                    blocks[Self::index(x, y, z)] = natural_block_at(wx, wy, wz);
+                    blocks[Self::index(x, y, z)] =
+                        crate::terrain::natural_block_at_with_surface(wx, wy, wz, sy);
                 }
             }
         }
 
-        place_trees_in_chunk(&mut blocks, pos.0, pos.1, pos.2);
+        let boundary_mask = place_trees_in_chunk(&mut blocks, pos.0, pos.1, pos.2);
 
-        Chunk { blocks, pos }
+        (Chunk { blocks, pos }, boundary_mask)
     }
 
     /// Build a Bevy Mesh from this chunk's block data.
@@ -88,15 +103,24 @@ impl Chunk {
     /// occlusion contract — fully interior blocks produce zero geometry.
     /// The padded 18³ buffer includes 1 block of neighbor data on each
     /// side so that faces at chunk boundaries are correctly culled against
-    /// the neighboring chunk's blocks (or Air if neighbor is unloaded).
+    /// the neighboring chunk's blocks. Unloaded neighbors are predicted
+    /// from deterministic terrain (see the shell pre-fill below) rather
+    /// than treated as Air.
     ///
     /// RENDERING NOTE: all vertex positions are in float chunk-local space
     /// (0.0..16.0). The chunk's world offset is applied via Transform in
     /// handle_chunk_tasks. UVs map into a texture atlas using float division
-    /// (tile_uv_size = 0.25 for a 4×4 atlas). The 0.01 epsilon in face-axis
-    /// detection avoids misclassification from float imprecision in quad
-    /// vertex positions.
-    pub fn build_mesh(&self, neighbors: &ChunkNeighbors, greedy: bool, highlight_greedy: bool) -> Mesh {
+    /// (tile_uv_size = 1/ATLAS_TILES_PER_ROW; 0.125 for the current 8×8
+    /// atlas). Per-vertex color carries face brightness × baked ambient
+    /// occlusion (see vertex_ao / ao_strength).
+    pub fn build_mesh(
+        &self,
+        neighbors: &ChunkNeighbors,
+        greedy: bool,
+        highlight_greedy: bool,
+        ao_strength: f32,
+    ) -> Mesh {
+        let ao_strength = ao_strength.clamp(0.0, 1.0);
         // Build padded 18x18x18 voxel buffer
         let mut padded = [BlockType::AIR; PaddedChunkShape::SIZE as usize];
 
@@ -114,7 +138,63 @@ impl Chunk {
             }
         }
 
-        // Fill padding from neighbors
+        // Pre-fill the ENTIRE padding shell (6 face slabs + 12 edges +
+        // 8 corners) from deterministic terrain. Two reasons:
+        //
+        //  - Face slabs: an unloaded neighbor used to read as AIR, so a
+        //    buried chunk emitted a full 16×16 wall of boundary quads on
+        //    every unloaded side — geometry that was never visible but
+        //    persisted forever (nothing remeshed on neighbor load). With
+        //    terrain prediction the walls are culled correctly from the
+        //    first mesh. Real neighbor data (below) overwrites these cells
+        //    when available; divergence from raw terrain (trees, player
+        //    edits) is reconciled by the boundary-mask remesh pass in
+        //    handle_chunk_tasks.
+        //
+        //  - Edge/corner cells: never covered by the 6 face neighbors, but
+        //    vertex AO samples diagonal blocks. Terrain data here keeps AO
+        //    seam-free across chunk borders on hillsides. (Player edits and
+        //    trees exactly on a diagonal boundary can still produce a
+        //    subtly-off AO corner — cosmetic and rare.)
+        //
+        // Cost: one surface_y per padded column (cached below) plus one
+        // block classification per shell cell (~1.8k cells).
+        {
+            let base_x = self.pos.0 * CHUNK_SIZE;
+            let base_y = self.pos.1 * CHUNK_SIZE;
+            let base_z = self.pos.2 * CHUNK_SIZE;
+            let mut col_surface = [[0i32; 18]; 18];
+            for (pz, row) in col_surface.iter_mut().enumerate() {
+                for (px, slot) in row.iter_mut().enumerate() {
+                    *slot = crate::terrain::surface_y(
+                        base_x + px as i32 - 1,
+                        base_z + pz as i32 - 1,
+                    );
+                }
+            }
+            for pz in 0..18u32 {
+                for py in 0..18u32 {
+                    for px in 0..18u32 {
+                        let on_shell = px == 0 || px == 17
+                            || py == 0 || py == 17
+                            || pz == 0 || pz == 17;
+                        if !on_shell {
+                            continue;
+                        }
+                        let pi = PaddedChunkShape::linearize([px, py, pz]);
+                        padded[pi as usize] = crate::terrain::natural_block_at_with_surface(
+                            base_x + px as i32 - 1,
+                            base_y + py as i32 - 1,
+                            base_z + pz as i32 - 1,
+                            col_surface[pz as usize][px as usize],
+                        );
+                    }
+                }
+            }
+        }
+
+        // Fill padding from neighbors (overwrites the terrain prediction
+        // with real data — including player modifications and trees).
         // Neighbor order: -X, +X, -Y, +Y, -Z, +Z
         // -X face (padded x=0, chunk x=15 of neighbor)
         if let Some(neg_x) = neighbors.neighbors[0] {
@@ -215,9 +295,66 @@ impl Chunk {
         let uv_inset = tile_uv_size * 0.03;
         let tile_span = tile_uv_size - 2.0 * uv_inset;
 
+        // --- Vertex ambient occlusion -----------------------------------
+        // Classic voxel AO ("0fps" formulation): for each face vertex,
+        // sample the two edge-adjacent blocks and the corner block on the
+        // face's normal side. Level 3 = fully open, 0 = pinched corner.
+        // Runs against the padded buffer, whose shell is always populated
+        // (real neighbor data or terrain prediction), so terrain AO is
+        // seam-free across chunk borders.
+        let ao_curve = |level: u8| -> f32 {
+            // Brightness multiplier per occlusion level, blended toward
+            // 1.0 (no AO) by DevSettings.ao_strength.
+            const AO_LEVELS: [f32; 4] = [0.55, 0.72, 0.86, 1.0];
+            1.0 + (AO_LEVELS[level as usize] - 1.0) * ao_strength
+        };
+
+        // `voxel` is the padded-space coord of the solid block owning the
+        // face; `cu`/`cv` select the face corner (false = min side).
+        // Samples one block outside the padded buffer resolve as open —
+        // that's the 1-block-padding limit; it can only over-brighten a
+        // diagonal at a chunk border, never darken.
+        let vertex_ao = |voxel: [u32; 3],
+                         norm_ax: usize,
+                         norm_sign: i32,
+                         ax_u: usize,
+                         ax_v: usize,
+                         cu: bool,
+                         cv: bool|
+         -> u8 {
+            let mut base = [voxel[0] as i32, voxel[1] as i32, voxel[2] as i32];
+            base[norm_ax] += norm_sign;
+            let du: i32 = if cu { 1 } else { -1 };
+            let dv: i32 = if cv { 1 } else { -1 };
+            let sample = |p: [i32; 3]| -> bool {
+                if p.iter().any(|c| !(0..18).contains(c)) {
+                    return false;
+                }
+                let pi = PaddedChunkShape::linearize([p[0] as u32, p[1] as u32, p[2] as u32]);
+                padded[pi as usize].is_opaque()
+            };
+            let mut s1 = base;
+            s1[ax_u] += du;
+            let mut s2 = base;
+            s2[ax_v] += dv;
+            let mut corner = base;
+            corner[ax_u] += du;
+            corner[ax_v] += dv;
+            let (side1, side2, corner) = (sample(s1), sample(s2), sample(corner));
+            if side1 && side2 {
+                0
+            } else {
+                3 - (side1 as u8 + side2 as u8 + corner as u8)
+            }
+        };
+
         // Helper: emit a single quad into the mesh buffers.
-        // `p0..p3` are in padded space (offset by -1 to chunk-local).
-        // `w` and `h` are the quad dimensions in blocks (1 for non-greedy).
+        // `corners` are 4 face corners in padded space, in ANY order — the
+        // helper classifies them into ring order on (ax_u, ax_v), fixes
+        // winding against `normal`, and picks the triangulation diagonal
+        // from per-corner AO (split along the brighter diagonal so a dark
+        // corner reads as a crease instead of an X artifact). `ao` holds
+        // final brightness multipliers aligned with `corners`.
         let emit_quad = |
             positions: &mut Vec<[f32; 3]>,
             normals: &mut Vec<[f32; 3]>,
@@ -225,19 +362,26 @@ impl Chunk {
             uvs: &mut Vec<[f32; 2]>,
             indices: &mut Vec<u32>,
             corners: [[f32; 3]; 4],
+            ao: [f32; 4],
             normal: [f32; 3],
             face_brightness: f32,
             tile_u0: f32,
             tile_v0: f32,
             ax_u: usize,
             ax_v: usize,
-            _w: f32,
-            _h: f32,
         | {
             let idx = positions.len() as u32;
-            let min_u = corners[0][ax_u];
-            let min_v = corners[0][ax_v];
+            let mut min_u = f32::INFINITY;
+            let mut max_u = f32::NEG_INFINITY;
+            let mut min_v = f32::INFINITY;
+            let mut max_v = f32::NEG_INFINITY;
             for c in &corners {
+                min_u = min_u.min(c[ax_u]);
+                max_u = max_u.max(c[ax_u]);
+                min_v = min_v.min(c[ax_v]);
+                max_v = max_v.max(c[ax_v]);
+            }
+            for (c, a) in corners.iter().zip(ao.iter()) {
                 positions.push([c[0] - 1.0, c[1] - 1.0, c[2] - 1.0]);
                 // Tiled UVs: each block-sized cell maps to the full atlas tile.
                 // The inset shrinks the per-tile [0, tile_uv_size] range to
@@ -250,10 +394,51 @@ impl Chunk {
                     tile_v0 + uv_inset + lv * tile_span,
                 ]);
                 normals.push(normal);
-                colors.push([face_brightness, face_brightness, face_brightness, 1.0]);
+                let b = face_brightness * a;
+                colors.push([b, b, b, 1.0]);
             }
-            for i in &[0u32, 1, 2, 0, 2, 3] {
-                indices.push(idx + i);
+            // Ring classification: which pushed corner sits at each
+            // (u, v) extreme — ring order (0,0), (1,0), (1,1), (0,1).
+            let mid_u = (min_u + max_u) * 0.5;
+            let mid_v = (min_v + max_v) * 0.5;
+            let mut ring = [0usize; 4];
+            for (i, c) in corners.iter().enumerate() {
+                let slot = match (c[ax_u] > mid_u, c[ax_v] > mid_v) {
+                    (false, false) => 0,
+                    (true, false) => 1,
+                    (true, true) => 2,
+                    (false, true) => 3,
+                };
+                ring[slot] = i;
+            }
+            // Winding: if the ring's geometric normal opposes the face
+            // normal, swap to keep front faces outward (backface culling).
+            let e01 = [
+                corners[ring[1]][0] - corners[ring[0]][0],
+                corners[ring[1]][1] - corners[ring[0]][1],
+                corners[ring[1]][2] - corners[ring[0]][2],
+            ];
+            let e03 = [
+                corners[ring[3]][0] - corners[ring[0]][0],
+                corners[ring[3]][1] - corners[ring[0]][1],
+                corners[ring[3]][2] - corners[ring[0]][2],
+            ];
+            let cross = [
+                e01[1] * e03[2] - e01[2] * e03[1],
+                e01[2] * e03[0] - e01[0] * e03[2],
+                e01[0] * e03[1] - e01[1] * e03[0],
+            ];
+            if cross[0] * normal[0] + cross[1] * normal[1] + cross[2] * normal[2] < 0.0 {
+                ring.swap(1, 3);
+            }
+            // AO diagonal flip: split along the brighter diagonal.
+            let tris = if ao[ring[0]] + ao[ring[2]] > ao[ring[1]] + ao[ring[3]] {
+                [ring[1], ring[2], ring[3], ring[1], ring[3], ring[0]]
+            } else {
+                [ring[0], ring[1], ring[2], ring[0], ring[2], ring[3]]
+            };
+            for t in tris {
+                indices.push(idx + t as u32);
             }
         };
 
@@ -279,8 +464,12 @@ impl Chunk {
                 (0, 1) // XY face
             };
 
+            let norm_sign = (normal.x + normal.y + normal.z).signum();
+            let norm_ax = if normal.x.abs() > 0 { 0usize }
+                else if normal.y.abs() > 0 { 1 } else { 2 };
+
             if !greedy {
-                // Baseline path: one quad per visible face, unchanged from original.
+                // Baseline path: one quad per visible face.
                 for unit_quad in group.iter() {
                     let quad = block_mesh::UnorientedQuad::from(*unit_quad);
                     let voxel = padded[PaddedChunkShape::linearize(unit_quad.minimum) as usize];
@@ -291,7 +480,6 @@ impl Chunk {
                     let tile_v0 = tile_y as f32 * tile_uv_size;
                     let mesh_positions = face.quad_mesh_positions(&quad, 1.0);
 
-                    let idx = positions.len() as u32;
                     let mut min_pos = mesh_positions[0];
                     let mut max_pos = mesh_positions[0];
                     for p in &mesh_positions[1..] {
@@ -300,43 +488,46 @@ impl Chunk {
                             if p[a] > max_pos[a] { max_pos[a] = p[a]; }
                         }
                     }
-                    for pos in &mesh_positions {
-                        positions.push([pos[0] - 1.0, pos[1] - 1.0, pos[2] - 1.0]);
-                        let extent_u = max_pos[ax_u] - min_pos[ax_u];
-                        let extent_v = max_pos[ax_v] - min_pos[ax_v];
-                        let lu = if extent_u > 0.01 {
-                            (pos[ax_u] - min_pos[ax_u]) / extent_u
-                        } else { 0.0 };
-                        let lv = if extent_v > 0.01 {
-                            (pos[ax_v] - min_pos[ax_v]) / extent_v
-                        } else { 0.0 };
-                        uvs.push([
-                            tile_u0 + uv_inset + lu * tile_span,
-                            tile_v0 + uv_inset + lv * tile_span,
-                        ]);
+                    // Per-corner AO, aligned with mesh_positions order.
+                    let mut ao = [1.0f32; 4];
+                    for (i, p) in mesh_positions.iter().enumerate() {
+                        let cu = p[ax_u] > (min_pos[ax_u] + max_pos[ax_u]) * 0.5;
+                        let cv = p[ax_v] > (min_pos[ax_v] + max_pos[ax_v]) * 0.5;
+                        ao[i] = ao_curve(vertex_ao(
+                            unit_quad.minimum, norm_ax, norm_sign, ax_u, ax_v, cu, cv,
+                        ));
                     }
-                    for n in face.quad_mesh_normals() { normals.push(n); }
-                    for _ in 0..4 {
-                        colors.push([face_brightness, face_brightness, face_brightness, 1.0]);
-                    }
-                    for i in face.quad_mesh_indices(idx) { indices.push(i); }
+                    emit_quad(
+                        &mut positions, &mut normals, &mut colors, &mut uvs, &mut indices,
+                        [mesh_positions[0], mesh_positions[1], mesh_positions[2], mesh_positions[3]],
+                        ao, normal_arr, face_brightness,
+                        tile_u0, tile_v0, ax_u, ax_v,
+                    );
                 }
             } else {
                 // Greedy path: merge adjacent same-type quads along U axis only.
                 // Collect visible faces into a sparse map keyed by (normal_pos, v),
                 // then scan along U to merge consecutive same-type runs.
-
-                // Build a map: (slice_coord, v_coord) -> sorted list of (u_coord, block_type)
-                let norm_ax = if normal.x.abs() > 0 { 0usize }
-                    else if normal.y.abs() > 0 { 1 } else { 2 };
-
-                // Collect all visible faces for this direction into a grid.
-                // Key: (slice_in_normal_axis, v_coord) -> Vec<(u_coord, BlockType)>
-                let mut rows: HashMap<(u32, u32), Vec<(u32, BlockType)>> = HashMap::new();
+                //
+                // Faces also carry their 4-corner AO tuple (ring order) —
+                // two faces only merge when their tuples are identical, so
+                // the merged quad's interpolated AO is exactly what the
+                // individual quads would have shown. Uniform open terrain
+                // (AO = 3 everywhere) merges as before; runs stop at AO
+                // transitions like wall bases and ledges.
+                let mut rows: HashMap<(u32, u32), Vec<(u32, BlockType, [u8; 4])>> = HashMap::new();
 
                 for unit_quad in group.iter() {
                     let min = unit_quad.minimum;
                     let voxel = padded[PaddedChunkShape::linearize(min) as usize];
+
+                    // Ring-order AO for this face: (0,0), (1,0), (1,1), (0,1).
+                    let ao_t = [
+                        vertex_ao(min, norm_ax, norm_sign, ax_u, ax_v, false, false),
+                        vertex_ao(min, norm_ax, norm_sign, ax_u, ax_v, true, false),
+                        vertex_ao(min, norm_ax, norm_sign, ax_u, ax_v, true, true),
+                        vertex_ao(min, norm_ax, norm_sign, ax_u, ax_v, false, true),
+                    ];
 
                     // Skip emissive/transparent blocks — never merge them.
                     if voxel.is_emissive() || !voxel.is_opaque() {
@@ -346,12 +537,34 @@ impl Chunk {
                         let tile_x = block_idx % tiles_per_row;
                         let tile_y = block_idx / tiles_per_row;
                         let mesh_positions = face.quad_mesh_positions(&quad, 1.0);
+                        // Classify corners against the face midpoint so the
+                        // AO values align with block_mesh's vertex order.
+                        let mut min_p = mesh_positions[0];
+                        let mut max_p = mesh_positions[0];
+                        for p in &mesh_positions[1..] {
+                            for a in 0..3 {
+                                if p[a] < min_p[a] { min_p[a] = p[a]; }
+                                if p[a] > max_p[a] { max_p[a] = p[a]; }
+                            }
+                        }
+                        let mut ao = [1.0f32; 4];
+                        for (i, p) in mesh_positions.iter().enumerate() {
+                            let cu = p[ax_u] > (min_p[ax_u] + max_p[ax_u]) * 0.5;
+                            let cv = p[ax_v] > (min_p[ax_v] + max_p[ax_v]) * 0.5;
+                            let ring_slot = match (cu, cv) {
+                                (false, false) => 0,
+                                (true, false) => 1,
+                                (true, true) => 2,
+                                (false, true) => 3,
+                            };
+                            ao[i] = ao_curve(ao_t[ring_slot]);
+                        }
                         emit_quad(
                             &mut positions, &mut normals, &mut colors, &mut uvs, &mut indices,
                             [mesh_positions[0], mesh_positions[1], mesh_positions[2], mesh_positions[3]],
-                            normal_arr, face_brightness,
+                            ao, normal_arr, face_brightness,
                             tile_x as f32 * tile_uv_size, tile_y as f32 * tile_uv_size,
-                            ax_u, ax_v, 1.0, 1.0,
+                            ax_u, ax_v,
                         );
                         continue;
                     }
@@ -361,7 +574,7 @@ impl Chunk {
                     let u_coord = min[ax_u];
                     rows.entry((slice_coord, v_coord))
                         .or_default()
-                        .push((u_coord, voxel));
+                        .push((u_coord, voxel, ao_t));
                 }
 
                 // Debug: track which faces the greedy merge covers.
@@ -372,11 +585,11 @@ impl Chunk {
 
                 // For each row, sort by U and merge consecutive same-type runs.
                 for ((_slice, _v), mut row) in rows {
-                    row.sort_by_key(|&(u, _)| u);
+                    row.sort_by_key(|&(u, _, _)| u);
 
                     let mut i = 0;
                     while i < row.len() {
-                        let (start_u, block) = row[i];
+                        let (start_u, block, run_ao) = row[i];
                         let mut end_u = start_u;
 
                         // Extend along U while:
@@ -385,12 +598,15 @@ impl Chunk {
                         //   - stays within chunk interior (padded 1..16, not into padding)
                         //   - same emissive status (never merge lit + unlit)
                         //   - same opacity (defensive — both should be opaque here)
+                        //   - identical AO tuple (constant along the run, so the
+                        //     merged quad interpolates AO exactly)
                         while i + 1 < row.len()
                             && row[i + 1].0 == end_u + 1
                             && row[i + 1].1 == block
                             && end_u + 1 <= 16  // never extend into padding (padded index 17)
                             && row[i + 1].1.is_emissive() == block.is_emissive()
                             && row[i + 1].1.is_opaque() == block.is_opaque()
+                            && row[i + 1].2 == run_ao
                         {
                             end_u = row[i + 1].0;
                             i += 1;
@@ -467,12 +683,21 @@ impl Chunk {
                         } else {
                             face_brightness
                         };
+                        // Corners c0..c3 are built in ring order, matching
+                        // run_ao's ring order — and the tuple is constant
+                        // along the run, so endpoint AO is exact.
+                        let ao = [
+                            ao_curve(run_ao[0]),
+                            ao_curve(run_ao[1]),
+                            ao_curve(run_ao[2]),
+                            ao_curve(run_ao[3]),
+                        ];
                         emit_quad(
                             &mut positions, &mut normals, &mut colors, &mut uvs, &mut indices,
                             [c0, c1, c2, c3],
-                            normal_arr, greedy_brightness,
+                            ao, normal_arr, greedy_brightness,
                             tile_u0, tile_v0,
-                            ax_u, ax_v, w, 1.0,
+                            ax_u, ax_v,
                         );
                         // Override colors for highlighted greedy quads.
                         if highlight_greedy && w > 1.0 {
@@ -634,5 +859,157 @@ impl Chunk {
         mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
         mesh.insert_indices(Indices::U32(indices));
         mesh
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terrain::{natural_block_at, natural_block_at_with_surface, surface_y};
+
+    const NO_NEIGHBORS: ChunkNeighbors = ChunkNeighbors { neighbors: [None; 6] };
+
+    fn mesh_stats(mesh: &Mesh) -> (usize, usize) {
+        let verts = mesh.count_vertices();
+        let indices = mesh.indices().map(|i| i.len()).unwrap_or(0);
+        (verts, indices)
+    }
+
+    /// A fully buried chunk with NO loaded neighbors must produce zero
+    /// geometry: the terrain-predicted padding shell culls the boundary
+    /// walls. Regression test for the hidden-wall bug (each buried chunk
+    /// used to emit up to 6×256 invisible quads that persisted forever).
+    #[test]
+    fn buried_chunk_produces_no_geometry() {
+        // Chunk y=-3 spans blocks -48..-33; surface is 0..10, so every
+        // block is >= 33 deep — solid rock, surrounded by solid rock.
+        let chunk = Chunk::generate(ChunkPos(0, -3, 0));
+        assert!(chunk.blocks.iter().all(|b| *b != BlockType::AIR));
+        let mesh = chunk.build_mesh(&NO_NEIGHBORS, false, false, 1.0);
+        let (verts, _) = mesh_stats(&mesh);
+        assert_eq!(verts, 0, "buried chunk emitted {} hidden-wall vertices", verts);
+    }
+
+    /// An all-air sky chunk produces zero geometry.
+    #[test]
+    fn sky_chunk_produces_no_geometry() {
+        let chunk = Chunk::generate(ChunkPos(0, 10, 0));
+        assert!(chunk.blocks.iter().all(|b| *b == BlockType::AIR));
+        let (verts, _) = mesh_stats(&chunk.build_mesh(&NO_NEIGHBORS, false, false, 1.0));
+        assert_eq!(verts, 0);
+    }
+
+    /// A surface chunk produces valid, well-formed geometry in both the
+    /// naive and greedy paths: attribute arrays line up, index count is a
+    /// multiple of 3, and every index is in range.
+    #[test]
+    fn surface_chunk_mesh_is_well_formed() {
+        let chunk = Chunk::generate(ChunkPos(0, 0, 0));
+        for greedy in [false, true] {
+            let mesh = chunk.build_mesh(&NO_NEIGHBORS, greedy, false, 1.0);
+            let (verts, index_count) = mesh_stats(&mesh);
+            assert!(verts > 0, "surface chunk produced no geometry (greedy={greedy})");
+            assert_eq!(index_count % 3, 0);
+            if let Some(indices) = mesh.indices() {
+                assert!(
+                    indices.iter().all(|i| i < verts),
+                    "index out of range (greedy={greedy})"
+                );
+            }
+            let uvs = mesh.attribute(Mesh::ATTRIBUTE_UV_0).unwrap().len();
+            let normals = mesh.attribute(Mesh::ATTRIBUTE_NORMAL).unwrap().len();
+            let colors = mesh.attribute(Mesh::ATTRIBUTE_COLOR).unwrap().len();
+            assert_eq!(verts, uvs);
+            assert_eq!(verts, normals);
+            assert_eq!(verts, colors);
+        }
+    }
+
+    /// Greedy meshing must never produce MORE vertices than the naive path.
+    #[test]
+    fn greedy_never_exceeds_naive() {
+        let chunk = Chunk::generate(ChunkPos(3, 0, -2));
+        let naive = chunk.build_mesh(&NO_NEIGHBORS, false, false, 1.0).count_vertices();
+        let greedy = chunk.build_mesh(&NO_NEIGHBORS, true, false, 1.0).count_vertices();
+        assert!(greedy <= naive, "greedy {} > naive {}", greedy, naive);
+    }
+
+    /// ao_strength = 0 must disable all AO darkening: every color channel
+    /// equals plain face brightness (1.0 / 0.82 / 0.5 shades only).
+    #[test]
+    fn ao_strength_zero_matches_flat_shading() {
+        let chunk = Chunk::generate(ChunkPos(0, 0, 0));
+        let mesh = chunk.build_mesh(&NO_NEIGHBORS, false, false, 0.0);
+        let Some(bevy::mesh::VertexAttributeValues::Float32x4(colors)) =
+            mesh.attribute(Mesh::ATTRIBUTE_COLOR)
+        else {
+            panic!("missing color attribute");
+        };
+        for c in colors {
+            let is_flat_shade = (c[0] - 1.0).abs() < 1e-5
+                || (c[0] - 0.82).abs() < 1e-5
+                || (c[0] - 0.5).abs() < 1e-5;
+            assert!(is_flat_shade, "unexpected color {:?} with ao_strength=0", c);
+        }
+    }
+
+    /// The column-cached terrain path must be byte-identical to the
+    /// original per-block path (save compatibility).
+    #[test]
+    fn cached_surface_terrain_is_identical() {
+        for x in -20..20 {
+            for z in -20..20 {
+                let sy = surface_y(x, z);
+                for y in (sy - 4)..(sy + 3) {
+                    assert_eq!(
+                        natural_block_at(x, y, z),
+                        natural_block_at_with_surface(x, y, z, sy),
+                        "divergence at ({x},{y},{z})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// generate() and generate_tracked() must agree, and the boundary mask
+    /// must be set whenever a tree block sits on the corresponding
+    /// outermost layer.
+    #[test]
+    fn boundary_mask_matches_tree_content() {
+        for (cx, cz) in [(0, 0), (1, 3), (-2, 5), (7, -4), (10, 10)] {
+            let pos = ChunkPos(cx, 0, cz);
+            let (chunk, mask) = Chunk::generate_tracked(pos);
+            // Recompute divergence from pure terrain per face.
+            let layer_diverges = |face: usize| -> bool {
+                let (fixed_axis, fixed_val) = match face {
+                    0 => (0, 0), 1 => (0, CHUNK_SIZE - 1),
+                    2 => (1, 0), 3 => (1, CHUNK_SIZE - 1),
+                    4 => (2, 0), _ => (2, CHUNK_SIZE - 1),
+                };
+                for a in 0..CHUNK_SIZE {
+                    for b in 0..CHUNK_SIZE {
+                        let (lx, ly, lz) = match fixed_axis {
+                            0 => (fixed_val, a, b),
+                            1 => (a, fixed_val, b),
+                            _ => (a, b, fixed_val),
+                        };
+                        let wx = pos.0 * CHUNK_SIZE + lx;
+                        let wy = pos.1 * CHUNK_SIZE + ly;
+                        let wz = pos.2 * CHUNK_SIZE + lz;
+                        if chunk.blocks[Chunk::index(lx, ly, lz)] != natural_block_at(wx, wy, wz) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            };
+            for face in 0..6 {
+                assert_eq!(
+                    mask[face],
+                    layer_diverges(face),
+                    "mask mismatch on face {face} of chunk ({cx},0,{cz})"
+                );
+            }
+        }
     }
 }

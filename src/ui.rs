@@ -788,7 +788,15 @@ fn toggle_menu(
     windows: Query<&Window, With<PrimaryWindow>>,
     game_settings: Res<GameSettings>,
     mut next_state: ResMut<NextState<GameState>>,
+    pending_reload: Res<crate::PendingReload>,
 ) {
+    // A Play/Load reload is counting down — the menu is already closed and
+    // the world is about to be torn down. Ignore menu toggles until the
+    // transition fires so the screenshot frames stay clean.
+    if pending_reload.active {
+        return;
+    }
+
     if keys.just_pressed(KeyCode::KeyM) {
         if menu_state.is_open {
             // Close menu — ensure we're in Gameplay (handles both the initial
@@ -984,11 +992,12 @@ fn handle_play_and_load_buttons(
     menu_query: Query<Entity, With<SettingsMenu>>,
     mut windows: Query<(&Window, &mut CursorOptions), With<PrimaryWindow>>,
     mut load_dialog: ResMut<crate::save_load::OpenLoadDialog>,
-    mut next_state: ResMut<NextState<GameState>>,
+    state: Res<State<GameState>>,
     mut start_mode: ResMut<crate::save_load::StartMode>,
     mut teardown_intent: ResMut<crate::TeardownIntent>,
     mut world_instance: ResMut<crate::WorldInstanceId>,
     mut pending_teardown: ResMut<crate::PendingTeardown>,
+    mut pending_reload: ResMut<crate::PendingReload>,
 ) {
     // Play = New Game — generate a fresh world, ignore saved modifications.
     for i in &play_q {
@@ -1010,9 +1019,24 @@ fn handle_play_and_load_buttons(
                 grab_cursor(&mut cursor);
                 menu_state.cursor_captured = true;
             }
+            // Capture the menu background screenshot NOW: the menu UI is
+            // despawned in this same command batch and the world is still
+            // alive for the deferred frames, so the renderer captures a
+            // clean world frame. Only applies to the in-game overlay path —
+            // from the title menu there is no world to capture.
+            if *state.get() == GameState::Gameplay {
+                crate::request_menu_screenshot(&mut commands);
+            }
             #[cfg(debug_assertions)]
-            bevy::log::info!("State transition: Menu → Gameplay (trigger=Play/NewGame, teardown=NewGame)");
-            next_state.set(GameState::Gameplay);
+            bevy::log::info!(
+                "Reload scheduled: Play/NewGame (teardown=NewGame, defer={} frames)",
+                crate::RELOAD_DEFER_FRAMES,
+            );
+            // Deferred transition — see PendingReload in main.rs.
+            *pending_reload = crate::PendingReload {
+                active: true,
+                frames: crate::RELOAD_DEFER_FRAMES,
+            };
             return;
         }
     }
@@ -3338,57 +3362,16 @@ impl_default!(
 );
 
 /// Save game state (player position + block modifications) before quitting.
+/// Thin wrapper over save_load::write_quick_save — the single owner of the
+/// save schema. The hand-rolled serializer that used to live here lacked
+/// last_menu_background_image_path, so quitting from the menu silently
+/// dropped the screenshot path and the next launch lost its menu background.
 fn save_game_state(
     chunk_manager: Option<&crate::chunk_manager::ChunkManager>,
     player_query: &Query<(&Transform, &crate::player::Player)>,
 ) {
-    use serde::{Deserialize, Serialize};
-
-    #[derive(Serialize, Deserialize)]
-    struct SaveData {
-        player_position: [f32; 3],
-        player_yaw: f32,
-        player_pitch: f32,
-        home_position: Option<[f32; 3]>,
-        modifications: Vec<SaveMod>,
-    }
-    #[derive(Serialize, Deserialize)]
-    struct SaveMod {
-        x: i32,
-        y: i32,
-        z: i32,
-        block_type: u8,
-    }
-
     let Some(cm) = chunk_manager else { return };
-    let Some((transform, player)) = player_query.iter().next() else {
-        return;
-    };
-
-    let modifications: Vec<SaveMod> = cm
-        .modifications
-        .iter()
-        .map(|(pos, &block)| SaveMod {
-            x: pos.x,
-            y: pos.y,
-            z: pos.z,
-            block_type: block.index(),
-        })
-        .collect();
-
-    let save = SaveData {
-        player_position: transform.translation.to_array(),
-        player_yaw: player.yaw,
-        player_pitch: player.pitch,
-        home_position: player.home_position.map(|p| p.to_array()),
-        modifications,
-    };
-
-    let path = dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".metalworld_save.json");
-    if let Ok(data) = serde_json::to_string_pretty(&save) {
-        let _ = std::fs::write(path, data);
+    if crate::save_load::write_quick_save(cm, player_query) {
         info!("Game auto-saved on quit");
     }
 }

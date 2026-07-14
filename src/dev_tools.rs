@@ -33,16 +33,23 @@ pub struct DevSettings {
     pub jump_velocity: f32,
     pub gravity: f32,
     pub mouse_sensitivity: f32,
-    pub fov: f32,
-    pub render_distance: i32,
-    pub fog_density: f32,
+    /// Length of a full day/night cycle in seconds (read by update_sun_cycle).
     pub day_cycle_duration: f32,
-    pub ambient_min: f32,
+    /// Lantern point-light radius in blocks (read by update_lantern_lights;
+    /// fps_120_mode scales it down — see adapt_shadows_for_fps_mode).
     pub lantern_radius: f32,
     pub break_interval: f32,
     pub place_interval: f32,
     pub reach: f32,
     pub animal_count: u32,
+    /// Max completed chunk-generation tasks meshed per frame on the main
+    /// thread. Caps the per-frame hitch during initial load / fast movement.
+    /// Also budgets the deferred remesh queue (neighbor-load and registry
+    /// invalidations) in remesh_dirty_chunks.
+    pub max_chunk_meshes_per_frame: u32,
+    /// Vertex ambient-occlusion strength: 0.0 = off, 1.0 = full corner
+    /// darkening. Takes effect on newly (re)meshed chunks.
+    pub ao_strength: f32,
     pub show_fps: bool,
     /// Debug: draw chunk bounding boxes colored by face density. Toggle with F4.
     pub show_chunk_bounds: bool,
@@ -60,16 +67,16 @@ impl Default for DevSettings {
             jump_velocity: 12.0,
             gravity: -28.0,
             mouse_sensitivity: 0.0007,
-            fov: 70.0,
-            render_distance: 5,
-            fog_density: 0.00003,
             day_cycle_duration: 600.0,
-            ambient_min: 0.08,
-            lantern_radius: 8.0,
+            // 12.0 matches the visual result the hardcoded PointLight range
+            // produced before this field was wired up.
+            lantern_radius: 12.0,
             break_interval: 0.15,
             place_interval: 0.18,
             reach: 8.0,
             animal_count: 60,
+            max_chunk_meshes_per_frame: 8,
+            ao_strength: 1.0,
             show_fps: true,
             show_chunk_bounds: false,
             highlight_greedy_quads: false,
@@ -87,92 +94,33 @@ impl Default for DevSettings {
 /// is forbidden. If the baseline is broken, fix it first.
 /// No optimization code may run unless its flag is true.
 ///
-/// VALIDATED OPTIMIZATION ORDER:
+/// The one remaining flag: greedy meshing (single-axis U merge with a
+/// debug kill-switch — see chunk.rs GREEDY_INVARIANT_VIOLATED).
 ///
-///   1. enable_greedy_meshing       PROVEN — single-axis U merge, kill-switch active
-///   2. Bevy built-in visibility     PROVEN — always on, never disable
-///      Bevy's check_visibility + frustum culling is the engine default.
-///      Never insert NoFrustumCulling on chunk entities. Never opt entities
-///      out of frustum culling. This is not a flag — it is a hard rule.
-///   3. enable_render_scale          optional, OFF by default
-///   4. enable_120fps_mode           optional, OFF by default
+/// The other flags this struct used to declare (enable_face_culling,
+/// enable_chunk_culling, enable_render_scale, enable_120fps_mode) were
+/// never read by any system: face culling and chunk unloading are always
+/// on (they are correctness features, not optimizations), and render
+/// scale / 120fps mode are driven by GameSettings (render_scale,
+/// fps_120_mode). They were removed rather than wired — a safety switch
+/// that doesn't switch anything is worse than none.
 ///
-///   Other flags (enable_face_culling, enable_chunk_culling) remain for
-///   future validation but are OFF and untested.
-///
-/// REINTRODUCTION PROTOCOL — enable one flag at a time:
-///
-///   Step 1: enable_face_culling
-///     - Skips faces between adjacent opaque blocks.
-///     - Validate: walk around world, check chunk boundaries, F4 overlay.
-///     - FAIL: disable immediately.
-///
-///   Step 2: enable_chunk_culling
-///     - Unloads chunks beyond render distance.
-///     - Validate: fly to world edge and back, confirm chunks reload.
-///     - FAIL: disable immediately.
-///
-///   Step 3: enable_greedy_meshing (PROVEN)
-///     - Merges same-type coplanar faces along U axis.
-///     - Kill-switch auto-disables on invariant violation.
-///
-///   Step 4: enable_render_scale
-///     - Renders to scaled image, blits to window. OFF by default.
-///     - Validate: set render_scale to 0.75, confirm visuals. UI must
-///       remain sharp. Return to 1.0, confirm no artifacts.
-///     - FAIL: disable immediately.
-///
-///   Step 5: enable_120fps_mode
-///     - CPU frame pacing + reduced shadows. OFF by default.
-///     - Validate: toggle in settings, confirm frame pacing and shadows.
-///     - FAIL: disable immediately.
-///
-/// RULES:
-///   - Enable only ONE flag at a time.
-///   - Visually validate with F4 overlay before enabling the next.
-///   - If any block disappears, disable the flag IMMEDIATELY.
-///   - Never skip steps or enable multiple flags simultaneously.
-///   - All validation must compare against src_correctness_baseline/.
-///   - NEVER disable Bevy's built-in visibility or frustum culling.
-///   - NEVER insert NoFrustumCulling on any entity.
-///   - Any FPS regression requires reverting the last change.
-///
-/// RECOVERY:
-///   If visual correctness regresses at any step:
-///   1. STOP. Do not attempt to fix forward.
-///   2. Restore src/ from src_correctness_baseline/:
-///        cp -r src_correctness_baseline/* src/
-///   3. Verify the baseline compiles and renders correctly.
-///   4. Reapply changes one flag at a time following the protocol above.
-///   Never fix a regression by adding more code on top — always roll back
-///   to the last known-good state first.
+/// HARD RULES that outlive the removed flags:
+///   - Bevy's built-in visibility + frustum culling stays on. Never
+///     insert NoFrustumCulling on chunk entities.
+///   - Correctness gates all performance work: if any block or texture
+///     disappears after enabling greedy meshing, disable it immediately.
 #[derive(Resource)]
 pub struct OptimizationFlags {
-    /// Use face culling (skip faces between adjacent opaque blocks).
-    /// OFF = emit all 6 faces for every solid block.
-    pub enable_face_culling: bool,
     /// Merge adjacent coplanar same-type faces into larger quads.
     /// OFF = one quad per visible face.
     pub enable_greedy_meshing: bool,
-    /// Unload chunks beyond render distance.
-    /// OFF = keep all loaded chunks.
-    pub enable_chunk_culling: bool,
-    /// Render to a scaled image target and blit to window.
-    /// OFF = render directly to window at native resolution.
-    pub enable_render_scale: bool,
-    /// CPU frame pacing for 120 FPS target.
-    /// OFF = no frame limiter, no shadow reduction.
-    pub enable_120fps_mode: bool,
 }
 
 impl Default for OptimizationFlags {
     fn default() -> Self {
         Self {
-            enable_face_culling: false,
             enable_greedy_meshing: false,
-            enable_chunk_culling: false,
-            enable_render_scale: false,
-            enable_120fps_mode: false,
         }
     }
 }

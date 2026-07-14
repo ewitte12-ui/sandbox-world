@@ -8,7 +8,7 @@ use bevy::{
 
 use crate::block_types::BlockType;
 use crate::chunk::{Chunk, ChunkNeighbors, ChunkPos, CHUNK_SIZE};
-use crate::terrain::{natural_block_at, surface_y};
+use crate::terrain::natural_block_at;
 
 /// Default render distance in chunks (5 chunks = 80 blocks radius).
 pub const DEFAULT_RENDER_DISTANCE: i32 = 5;
@@ -40,11 +40,14 @@ pub struct ChunkMarker {
     pub pos: ChunkPos,
 }
 
-/// Component holding a background chunk generation task.
+/// Component holding a background chunk generation task. The task yields
+/// the chunk plus a boundary mask: which outermost layers contain
+/// non-terrain content (trees), in ChunkNeighbors face order. See
+/// Chunk::generate_tracked.
 #[derive(Component)]
 struct ComputeChunk {
     pos: ChunkPos,
-    task: Task<Chunk>,
+    task: Task<(Chunk, [bool; 6])>,
 }
 
 /// Resource managing the chunk lifecycle: loading, unloading, and block queries.
@@ -57,9 +60,6 @@ struct ComputeChunk {
 ///   Written by set_block() (called from player block_interact and save_load).
 ///   Modifications are applied on top of procedural terrain during chunk gen
 ///   and remeshing — they persist even when chunks are unloaded and reloaded.
-/// - `surface_cache`: lazily populated by surface_y_cached(). Never invalidated
-///   because the procedural surface_y is deterministic and never changes.
-///   Player block modifications don't affect surface_y (it's terrain-only).
 /// - `dirty_chunks`: transient set consumed each frame by remesh_dirty_chunks.
 ///   Populated by set_block() when a block is modified.
 #[derive(Resource)]
@@ -72,12 +72,23 @@ pub struct ChunkManager {
     pub render_distance: i32,
     /// Player-placed or removed block modifications (world coordinates).
     pub modifications: HashMap<IVec3, BlockType>,
-    /// Cached surface Y values per (x, z) column — never invalidated (deterministic).
-    pub surface_cache: HashMap<(i32, i32), i32>,
     /// Set of chunk positions currently being generated.
     pending: HashMap<ChunkPos, Entity>,
-    /// Set of chunk positions that need remeshing (block was modified).
+    /// Chunks needing an IMMEDIATE remesh (player edited a block). Fully
+    /// drained every frame — edits are ≤7 chunks and must show same-frame.
     dirty_chunks: HashSet<ChunkPos>,
+    /// Chunks needing a DEFERRED remesh (a neighbor loaded with
+    /// non-terrain boundary content, or the block registry changed).
+    /// Cosmetic-latency work: processed a budgeted batch per frame so a
+    /// bulk invalidation can't freeze a frame.
+    deferred_remesh: HashSet<ChunkPos>,
+    /// Bumped whenever `modifications` changes (set_block / clear_all).
+    /// Lets per-frame consumers (lantern lights) skip work when nothing changed.
+    pub mods_version: u64,
+    /// Bumped whenever loaded-chunk bookkeeping is invalidated wholesale
+    /// (clear_all, defensive entity-loss removal). Lets load_chunks skip
+    /// its full render-bubble scan when the player hasn't moved.
+    pub load_generation: u64,
 }
 
 impl Default for ChunkManager {
@@ -87,9 +98,11 @@ impl Default for ChunkManager {
             chunk_data: HashMap::new(),
             render_distance: DEFAULT_RENDER_DISTANCE,
             modifications: HashMap::new(),
-            surface_cache: HashMap::new(),
             pending: HashMap::new(),
             dirty_chunks: HashSet::new(),
+            deferred_remesh: HashSet::new(),
+            mods_version: 0,
+            load_generation: 0,
         }
     }
 }
@@ -108,8 +121,12 @@ impl ChunkManager {
         self.chunk_data.clear();
         self.pending.clear();
         self.dirty_chunks.clear();
+        self.deferred_remesh.clear();
         self.modifications.clear();
-        self.surface_cache.clear();
+        // Invalidate consumers' cached views of modifications / loaded chunks
+        // so lantern lights re-scan and load_chunks re-fills the bubble.
+        self.mods_version += 1;
+        self.load_generation += 1;
 
         // Reset the greedy-meshing kill-switch so a prior session's
         // tripped invariant doesn't persist into the next Gameplay.
@@ -143,12 +160,20 @@ impl ChunkManager {
     /// or hidden. Without dirtying the neighbor, seams/holes appear at chunk edges.
     pub fn set_block(&mut self, world_pos: IVec3, block_type: BlockType) {
         self.modifications.insert(world_pos, block_type);
+        self.mods_version += 1;
 
         let chunk_pos = world_to_chunk_pos(world_pos);
         self.dirty_chunks.insert(chunk_pos);
+        let local = world_to_local(world_pos);
+
+        // Keep loaded chunk data in sync so remesh_dirty_chunks can rebuild
+        // meshes straight from chunk_data instead of regenerating the chunk
+        // from terrain noise on the main thread.
+        if let Some(chunk) = self.chunk_data.get_mut(&chunk_pos) {
+            chunk.blocks[Chunk::index(local.x, local.y, local.z)] = block_type;
+        }
 
         // If the block is on a chunk boundary, also dirty the neighbor chunk
-        let local = world_to_local(world_pos);
         if local.x == 0 {
             self.dirty_chunks
                 .insert(ChunkPos(chunk_pos.0 - 1, chunk_pos.1, chunk_pos.2));
@@ -175,20 +200,16 @@ impl ChunkManager {
         }
     }
 
-    /// Mark all loaded chunks as dirty so they get remeshed (e.g. after color changes).
+    /// Queue every loaded chunk for a remesh (e.g. after block color /
+    /// registry changes). Goes through the DEFERRED set: with ~1k loaded
+    /// chunks, remeshing them all in one frame froze the game for seconds;
+    /// budgeted processing updates them progressively over ~a second.
     pub fn mark_all_dirty(&mut self) {
         for &pos in self.chunks.keys() {
-            self.dirty_chunks.insert(pos);
+            self.deferred_remesh.insert(pos);
         }
     }
 
-    /// Get the cached surface Y for a column, computing and caching if needed.
-    pub fn surface_y_cached(&mut self, x: i32, z: i32) -> i32 {
-        *self
-            .surface_cache
-            .entry((x, z))
-            .or_insert_with(|| surface_y(x, z))
-    }
 }
 
 /// Convert a world-space position to chunk coordinates.
@@ -710,6 +731,8 @@ fn load_chunks(
     mut manager: ResMut<ChunkManager>,
     cameras: Query<&GlobalTransform, With<Camera3d>>,
     game_settings: Option<Res<crate::settings::GameSettings>>,
+    world_id: Res<crate::WorldInstanceId>,
+    mut last_scan: Local<Option<(ChunkPos, i32, u64)>>,
 ) {
     // Use the camera position as the player position
     let camera_pos = match cameras.iter().next() {
@@ -725,9 +748,21 @@ fn load_chunks(
 
     // Use settings render_distance if available, otherwise use stored value
     if let Some(ref gs) = game_settings {
-        manager.render_distance = gs.render_distance;
+        if manager.render_distance != gs.render_distance {
+            manager.render_distance = gs.render_distance;
+        }
     }
     let rd = manager.render_distance;
+
+    // Missing chunks can only appear when the player chunk changes, the
+    // render distance changes, or the loaded-chunk bookkeeping is invalidated
+    // (load_generation bump). Skip the full render-bubble scan otherwise —
+    // it's ~1-2k HashMap probes per frame for nothing.
+    let scan_key = (player_chunk, rd, manager.load_generation);
+    if *last_scan == Some(scan_key) {
+        return;
+    }
+
     let thread_pool = AsyncComputeTaskPool::get();
 
     // Vertical loading range is asymmetric: only 2 chunks below the player
@@ -765,8 +800,15 @@ fn load_chunks(
     });
 
     for pos in candidates {
-        let entity = commands.spawn_empty().id();
-        let task = thread_pool.spawn(async move { Chunk::generate(pos) });
+        // Task entities carry the world markers from birth so world teardown
+        // despawns in-flight generation tasks too. Without these markers,
+        // tasks spawned before a Play/Load reload survive into the next
+        // session, complete alongside the new session's duplicate tasks for
+        // the same positions, and leave orphaned ghost chunk meshes.
+        let entity = commands
+            .spawn((crate::WorldEntity, crate::WorldScoped(world_id.0)))
+            .id();
+        let task = thread_pool.spawn(async move { Chunk::generate_tracked(pos) });
 
         commands.entity(entity).insert(ComputeChunk { pos, task });
         manager.pending.insert(pos, entity);
@@ -776,26 +818,71 @@ fn load_chunks(
             pos.0, pos.1, pos.2, entity,
         );
     }
+
+    *last_scan = Some(scan_key);
 }
 
 /// Apply player modifications to a freshly generated chunk. Used by both
 /// handle_chunk_tasks (initial load) and remesh_dirty_chunks (runtime) to
 /// ensure both paths produce identical block data.
-fn apply_modifications(chunk: &mut Chunk, modifications: &HashMap<IVec3, BlockType>) {
+/// Returns a mask of boundary layers a modification was written into
+/// (ChunkNeighbors face order) — used to decide which already-meshed
+/// neighbors must remesh because they meshed against terrain-predicted
+/// padding for this chunk.
+fn apply_modifications(
+    chunk: &mut Chunk,
+    modifications: &HashMap<IVec3, BlockType>,
+) -> [bool; 6] {
     let base_x = chunk.pos.0 * CHUNK_SIZE;
     let base_y = chunk.pos.1 * CHUNK_SIZE;
     let base_z = chunk.pos.2 * CHUNK_SIZE;
-    for lx in 0..CHUNK_SIZE {
-        for ly in 0..CHUNK_SIZE {
-            for lz in 0..CHUNK_SIZE {
-                let wp = IVec3::new(base_x + lx, base_y + ly, base_z + lz);
-                if let Some(&bt) = modifications.get(&wp) {
-                    chunk.blocks[Chunk::index(lx, ly, lz)] = bt;
+    let mut boundary_mask = [false; 6];
+
+    let mut write = |chunk: &mut Chunk, lx: i32, ly: i32, lz: i32, bt: BlockType| {
+        chunk.blocks[Chunk::index(lx, ly, lz)] = bt;
+        if lx == 0 { boundary_mask[0] = true; }
+        if lx == CHUNK_SIZE - 1 { boundary_mask[1] = true; }
+        if ly == 0 { boundary_mask[2] = true; }
+        if ly == CHUNK_SIZE - 1 { boundary_mask[3] = true; }
+        if lz == 0 { boundary_mask[4] = true; }
+        if lz == CHUNK_SIZE - 1 { boundary_mask[5] = true; }
+    };
+
+    // Iterate whichever side is smaller: probing the map 4096 times per
+    // chunk dominates initial world load when only a handful of player
+    // edits exist. Both paths produce identical results.
+    if modifications.len() < CHUNK_VOLUME_LOOKUPS {
+        for (&wp, &bt) in modifications {
+            let lx = wp.x - base_x;
+            let ly = wp.y - base_y;
+            let lz = wp.z - base_z;
+            if (0..CHUNK_SIZE).contains(&lx)
+                && (0..CHUNK_SIZE).contains(&ly)
+                && (0..CHUNK_SIZE).contains(&lz)
+            {
+                write(chunk, lx, ly, lz, bt);
+            }
+        }
+    } else {
+        for lx in 0..CHUNK_SIZE {
+            for ly in 0..CHUNK_SIZE {
+                for lz in 0..CHUNK_SIZE {
+                    let wp = IVec3::new(base_x + lx, base_y + ly, base_z + lz);
+                    if let Some(&bt) = modifications.get(&wp) {
+                        write(chunk, lx, ly, lz, bt);
+                    }
                 }
             }
         }
     }
+
+    boundary_mask
 }
+
+/// Crossover point for apply_modifications: below this many total
+/// modifications, iterating the modification map beats probing it once
+/// per block position (16³ = 4096 probes).
+const CHUNK_VOLUME_LOOKUPS: usize = (CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE) as usize;
 
 /// System: poll completed chunk generation tasks, build meshes, and insert into the world.
 fn handle_chunk_tasks(
@@ -838,11 +925,28 @@ fn handle_chunk_tasks(
         }
     }
 
-    for (entity, mut compute) in &mut tasks {
-        if let Some(mut chunk) = check_ready(&mut compute.task) {
-            let pos = compute.pos;
+    // Cap how many completed chunks are meshed per frame. Mesh building runs
+    // on the main thread; with no cap, a burst of completed generation tasks
+    // (initial load, fast movement) meshes dozens of chunks in one frame and
+    // produces a visible hitch. Remaining ready tasks are picked up on
+    // subsequent frames.
+    let mesh_budget = dev.max_chunk_meshes_per_frame.max(1) as usize;
+    let mut meshed_this_frame = 0usize;
 
-            apply_modifications(&mut chunk, &manager.modifications);
+    for (entity, mut compute) in &mut tasks {
+        if meshed_this_frame >= mesh_budget {
+            break;
+        }
+        if let Some((mut chunk, tree_mask)) = check_ready(&mut compute.task) {
+            let pos = compute.pos;
+            meshed_this_frame += 1;
+
+            let mods_mask = apply_modifications(&mut chunk, &manager.modifications);
+            // Boundary layers that diverge from raw terrain (trees or player
+            // edits). Neighbors already meshed used terrain-predicted padding
+            // for this chunk — only they, and only on divergent faces, need
+            // a (deferred) remesh.
+            let boundary_mask: [bool; 6] = std::array::from_fn(|i| tree_mask[i] || mods_mask[i]);
 
             // Debug: log block composition for chunks near origin to detect
             // corrupted save data overriding valid terrain generation.
@@ -871,7 +975,7 @@ fn handle_chunk_tasks(
                 }
             }
 
-            let no_neighbors = ChunkNeighbors {
+            let loaded_neighbors = ChunkNeighbors {
                 neighbors: [
                     manager.chunk_data.get(&ChunkPos(pos.0 - 1, pos.1, pos.2)),
                     manager.chunk_data.get(&ChunkPos(pos.0 + 1, pos.1, pos.2)),
@@ -881,20 +985,17 @@ fn handle_chunk_tasks(
                     manager.chunk_data.get(&ChunkPos(pos.0, pos.1, pos.2 + 1)),
                 ],
             };
-            let mesh = chunk.build_mesh(&no_neighbors, opt_flags.enable_greedy_meshing, dev.highlight_greedy_quads);
+            let mesh = chunk.build_mesh(
+                &loaded_neighbors,
+                opt_flags.enable_greedy_meshing,
+                dev.highlight_greedy_quads,
+                dev.ao_strength,
+            );
 
-            // Debug: warn if a non-air chunk produces an empty mesh.
-            #[cfg(debug_assertions)]
-            {
-                let has_solid = chunk.blocks.iter().any(|b| *b != BlockType::AIR);
-                if has_solid && mesh.count_vertices() == 0 {
-                    bevy::log::warn!(
-                        "Chunk ({},{},{}) has solid blocks but mesh has 0 vertices \
-                         — will render as invisible",
-                        pos.0, pos.1, pos.2,
-                    );
-                }
-            }
+            // NOTE: a solid chunk with 0 vertices is NORMAL here — fully
+            // buried chunks cull all faces against the terrain-predicted
+            // padding shell. build_mesh's debug invariant handles the real
+            // error case (exposed solid faces producing no geometry).
 
             let world_x = (pos.0 * CHUNK_SIZE) as f32;
             let world_y = (pos.1 * CHUNK_SIZE) as f32;
@@ -933,6 +1034,24 @@ fn handle_chunk_tasks(
             manager.chunks.insert(pos, entity);
             manager.pending.remove(&pos);
 
+            // Queue deferred remeshes for already-meshed neighbors on faces
+            // where this chunk diverges from raw terrain. They meshed
+            // against terrain-predicted padding (build_mesh shell fill) and
+            // are correct everywhere else, so untouched-terrain boundaries
+            // (the vast majority) trigger nothing.
+            const FACE_OFFSETS: [(i32, i32, i32); 6] = [
+                (-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1),
+            ];
+            for (face, &(dx, dy, dz)) in FACE_OFFSETS.iter().enumerate() {
+                if !boundary_mask[face] {
+                    continue;
+                }
+                let npos = ChunkPos(pos.0 + dx, pos.1 + dy, pos.2 + dz);
+                if manager.chunks.contains_key(&npos) {
+                    manager.deferred_remesh.insert(npos);
+                }
+            }
+
             #[cfg(debug_assertions)]
             bevy::log::trace!(
                 "Chunk MESH: ({},{},{}) entity={:?} verts={}",
@@ -956,13 +1075,36 @@ fn remesh_dirty_chunks(
     opt_flags: Res<crate::dev_tools::OptimizationFlags>,
     dev: Res<crate::dev_tools::DevSettings>,
 ) {
-    if manager.dirty_chunks.is_empty() {
+    if manager.dirty_chunks.is_empty() && manager.deferred_remesh.is_empty() {
         return;
     }
 
-    let dirty: Vec<ChunkPos> = manager.dirty_chunks.drain().collect();
+    // Immediate set (player edits): fully drained — must show same-frame,
+    // and edits touch ≤7 chunks. Deferred set (neighbor loads, registry
+    // changes): budgeted, so bulk invalidations spread across frames
+    // instead of freezing one.
+    let mut work: Vec<ChunkPos> = manager.dirty_chunks.drain().collect();
+    // An edit-dirtied chunk supersedes any deferred entry for the same pos.
+    for p in &work {
+        manager.deferred_remesh.remove(p);
+    }
+    let budget = dev.max_chunk_meshes_per_frame.max(1) as usize;
+    if work.len() < budget && !manager.deferred_remesh.is_empty() {
+        let take = budget - work.len();
+        let batch: Vec<ChunkPos> = manager
+            .deferred_remesh
+            .iter()
+            .copied()
+            .filter(|p| !work.contains(p))
+            .take(take)
+            .collect();
+        for p in &batch {
+            manager.deferred_remesh.remove(p);
+        }
+        work.extend(batch);
+    }
 
-    for pos in dirty {
+    for pos in work {
         // Only remesh chunks that are actually loaded
         let Some(&entity) = manager.chunks.get(&pos) else {
             continue;
@@ -973,44 +1115,61 @@ fn remesh_dirty_chunks(
         if mesh_query.get(entity).is_err() {
             manager.chunks.remove(&pos);
             manager.chunk_data.remove(&pos);
+            // A hole opened inside the render bubble — let load_chunks
+            // rescan and refill it even if the player hasn't moved.
+            manager.load_generation += 1;
             continue;
         }
 
-        // Regenerate the chunk from scratch, then apply modifications
-        // (same apply_modifications used by handle_chunk_tasks)
-        let mut chunk = Chunk::generate(pos);
-        apply_modifications(&mut chunk, &manager.modifications);
-
-        // Clone neighbor data to avoid borrow conflict when we later insert into chunk_data
-        let neighbor_positions = [
-            ChunkPos(pos.0 - 1, pos.1, pos.2),
-            ChunkPos(pos.0 + 1, pos.1, pos.2),
-            ChunkPos(pos.0, pos.1 - 1, pos.2),
-            ChunkPos(pos.0, pos.1 + 1, pos.2),
-            ChunkPos(pos.0, pos.1, pos.2 - 1),
-            ChunkPos(pos.0, pos.1, pos.2 + 1),
-        ];
-        let neighbor_chunks: Vec<Option<Chunk>> = neighbor_positions
-            .iter()
-            .map(|np| {
-                manager.chunk_data.get(np).map(|c| Chunk {
-                    blocks: c.blocks,
-                    pos: c.pos,
-                })
-            })
-            .collect();
-
-        let neighbors = ChunkNeighbors {
-            neighbors: [
-                neighbor_chunks[0].as_ref(),
-                neighbor_chunks[1].as_ref(),
-                neighbor_chunks[2].as_ref(),
-                neighbor_chunks[3].as_ref(),
-                neighbor_chunks[4].as_ref(),
-                neighbor_chunks[5].as_ref(),
-            ],
+        // chunk_data is the source of truth here: set_block writes modified
+        // blocks through to it, and handle_chunk_tasks stores fully modified
+        // chunks at load. Rebuilding the mesh from stored data avoids the
+        // old path's full terrain regeneration (noise + trees + 4096-probe
+        // modification pass) on the main thread for every dirtied chunk.
+        let mesh = if let Some(chunk) = manager.chunk_data.get(&pos) {
+            let neighbors = ChunkNeighbors {
+                neighbors: [
+                    manager.chunk_data.get(&ChunkPos(pos.0 - 1, pos.1, pos.2)),
+                    manager.chunk_data.get(&ChunkPos(pos.0 + 1, pos.1, pos.2)),
+                    manager.chunk_data.get(&ChunkPos(pos.0, pos.1 - 1, pos.2)),
+                    manager.chunk_data.get(&ChunkPos(pos.0, pos.1 + 1, pos.2)),
+                    manager.chunk_data.get(&ChunkPos(pos.0, pos.1, pos.2 - 1)),
+                    manager.chunk_data.get(&ChunkPos(pos.0, pos.1, pos.2 + 1)),
+                ],
+            };
+            chunk.build_mesh(
+                &neighbors,
+                opt_flags.enable_greedy_meshing,
+                dev.highlight_greedy_quads,
+                dev.ao_strength,
+            )
+        } else {
+            // Defensive fallback: tracked chunk without stored data (should
+            // not happen — chunks and chunk_data are inserted together).
+            // Regenerate exactly like the initial-load path.
+            let mut chunk = Chunk::generate(pos);
+            let _ = apply_modifications(&mut chunk, &manager.modifications);
+            let mesh = {
+                let neighbors = ChunkNeighbors {
+                    neighbors: [
+                        manager.chunk_data.get(&ChunkPos(pos.0 - 1, pos.1, pos.2)),
+                        manager.chunk_data.get(&ChunkPos(pos.0 + 1, pos.1, pos.2)),
+                        manager.chunk_data.get(&ChunkPos(pos.0, pos.1 - 1, pos.2)),
+                        manager.chunk_data.get(&ChunkPos(pos.0, pos.1 + 1, pos.2)),
+                        manager.chunk_data.get(&ChunkPos(pos.0, pos.1, pos.2 - 1)),
+                        manager.chunk_data.get(&ChunkPos(pos.0, pos.1, pos.2 + 1)),
+                    ],
+                };
+                chunk.build_mesh(
+                    &neighbors,
+                    opt_flags.enable_greedy_meshing,
+                    dev.highlight_greedy_quads,
+                    dev.ao_strength,
+                )
+            };
+            manager.chunk_data.insert(pos, chunk);
+            mesh
         };
-        let mesh = chunk.build_mesh(&neighbors, opt_flags.enable_greedy_meshing, dev.highlight_greedy_quads);
 
         // Update the mesh asset in-place, and ensure the material is present.
         // This unifies the runtime path with the initial-load path — both end
@@ -1026,9 +1185,6 @@ fn remesh_dirty_chunks(
                 }
             }
         }
-
-        // Update stored chunk data so future lookups reflect modifications
-        manager.chunk_data.insert(pos, chunk);
     }
 }
 
@@ -1088,6 +1244,7 @@ fn unload_chunks(
             }
         }
         manager.dirty_chunks.remove(&pos);
+        manager.deferred_remesh.remove(&pos);
     }
 }
 

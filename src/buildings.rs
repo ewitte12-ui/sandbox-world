@@ -63,14 +63,16 @@ fn place_one_building(
                 let door_max_x = door_min_x + 3;
                 let is_door = dz == 0 && dx >= door_min_x && dx <= door_max_x && dy < 5;
 
+                // Route through set_block — NOT a direct modifications.insert.
+                // set_block is the single write path that keeps loaded
+                // chunk_data in sync and bumps mods_version; remesh and the
+                // lantern system rely on that invariant. (At world init no
+                // chunks are loaded yet, so the dirty flags this sets are
+                // drained as no-ops.)
                 if is_roof {
-                    chunk_manager
-                        .modifications
-                        .insert(IVec3::new(x, y, z), BlockType::STONE);
+                    chunk_manager.set_block(IVec3::new(x, y, z), BlockType::STONE);
                 } else if is_wall && !is_door {
-                    chunk_manager
-                        .modifications
-                        .insert(IVec3::new(x, y, z), BlockType::WOOD);
+                    chunk_manager.set_block(IVec3::new(x, y, z), BlockType::WOOD);
                 }
             }
         }

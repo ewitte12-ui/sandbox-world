@@ -178,9 +178,13 @@ fn update_sun_cycle(
     cameras_without_fog: Query<Entity, (With<Camera3d>, Without<DistanceFog>)>,
     mut fog_query: Query<&mut DistanceFog>,
     game_settings: Option<Res<crate::settings::GameSettings>>,
+    dev: Res<crate::dev_tools::DevSettings>,
     mut commands: Commands,
 ) {
     let dt = time.delta_secs();
+
+    // Day length is a live dev tweakable.
+    sun_cycle.day_duration = dev.day_cycle_duration.max(1.0);
 
     // Advance angle
     sun_cycle.total_time += dt;
@@ -276,11 +280,25 @@ fn update_lantern_lights(
     cameras: Query<&GlobalTransform, With<Camera3d>>,
     existing: Query<(Entity, &Transform), With<LanternLight>>,
     world_id: Res<crate::WorldInstanceId>,
+    dev: Res<crate::dev_tools::DevSettings>,
+    mut last_scan: Local<Option<(u64, IVec3)>>,
 ) {
     let Some(cam_gt) = cameras.iter().next() else {
         return;
     };
     let cam_pos = cam_gt.translation();
+
+    // Lantern membership only changes when the modification set changes
+    // (mods_version, bumped by set_block/clear_all) or the camera crosses a
+    // block boundary (range checks). Skip the full modification scan +
+    // O(lights × lanterns) matching otherwise.
+    let mods_version = chunk_manager.as_ref().map(|cm| cm.mods_version).unwrap_or(0);
+    let cam_block = cam_pos.floor().as_ivec3();
+    let scan_key = (mods_version, cam_block);
+    if *last_scan == Some(scan_key) {
+        return;
+    }
+    *last_scan = Some(scan_key);
 
     // Collect lantern world positions from modifications within range.
     let mut lantern_positions: Vec<Vec3> = Vec::new();
@@ -324,7 +342,7 @@ fn update_lantern_lights(
             PointLight {
                 color: Color::linear_rgb(1.0, 0.85, 0.55), // warm glow
                 intensity: 30_000.0,  // subtle warm glow, not overpowering
-                range: 12.0,          // 12 block radius
+                range: dev.lantern_radius,
                 radius: 0.2,
                 shadows_enabled: false,
                 ..default()
@@ -342,10 +360,17 @@ fn update_lantern_lights(
 fn apply_color_grading(
     game_settings: Option<Res<crate::settings::GameSettings>>,
     mut cameras: Query<&mut ColorGrading, With<Camera3d>>,
+    added_cameras: Query<(), Added<Camera3d>>,
 ) {
     let Some(settings) = game_settings else {
         return;
     };
+    // Only write when settings changed or a camera was just spawned
+    // (world reload) — unconditional writes mark ColorGrading changed
+    // every frame for no reason.
+    if !settings.is_changed() && added_cameras.is_empty() {
+        return;
+    }
 
     for mut grading in &mut cameras {
         grading.global.post_saturation = 1.0;
@@ -369,10 +394,17 @@ fn apply_camera_settings(
     game_settings: Option<Res<crate::settings::GameSettings>>,
     mut cameras: Query<(Entity, &mut Projection), With<Camera3d>>,
     mut commands: Commands,
+    added_cameras: Query<(), Added<Camera3d>>,
 ) {
     let Some(settings) = game_settings else {
         return;
     };
+    // Only write when settings changed or a camera was just spawned (world
+    // reload). The old unconditional path re-inserted Exposure + Tonemapping
+    // components and dirtied Projection on every camera every frame.
+    if !settings.is_changed() && added_cameras.is_empty() {
+        return;
+    }
 
     for (entity, mut projection) in &mut cameras {
         // FOV
@@ -404,13 +436,17 @@ fn apply_render_pipeline_settings(
     game_settings: Option<Res<crate::settings::GameSettings>>,
     cameras: Query<Entity, With<Camera3d>>,
     mut commands: Commands,
+    added_cameras: Query<(), Added<Camera3d>>,
 ) {
     let Some(settings) = game_settings else {
         return;
     };
 
-    // Only run when settings actually change (initial setup is done in spawn_player)
-    if !settings.is_changed() {
+    // Run when settings change, or when a camera was just spawned (world
+    // reload) so the fresh camera doesn't rely solely on spawn_player's
+    // initial insert. spawn_player applies the same values, so the
+    // double-apply on the spawn frame is harmless.
+    if !settings.is_changed() && added_cameras.is_empty() {
         return;
     }
 
@@ -512,7 +548,6 @@ fn apply_render_scale(
     target: Option<ResMut<RenderScaleTarget>>,
     blit_camera_q: Query<Entity, With<RenderScaleBlit>>,
     blit_sprite_q: Query<Entity, With<RenderScaleSprite>>,
-    world_id: Res<crate::WorldInstanceId>,
 ) {
     let Some(settings) = game_settings else { return };
     let Ok(window) = windows.single() else { return };
@@ -604,9 +639,15 @@ fn apply_render_scale(
         // Spawn the blit sprite (full-screen quad textured with the render target).
         // custom_size uses logical window dimensions because the 2D camera's
         // orthographic projection operates in logical coordinates.
+        //
+        // Deliberately NOT WorldEntity/WorldScoped: the blit sprite and camera
+        // are render infrastructure (like MenuCamera), not world content.
+        // Marking them world-scoped meant teardown despawned them while the
+        // RenderScaleTarget resource survived — after a reload the early-out
+        // below then skipped rebuilding the pipeline, silently disabling
+        // render scaling.
         commands.spawn((
-            crate::WorldEntity,
-            crate::WorldScoped(world_id.0),
+            crate::UiOnly,
             RenderScaleSprite,
             Sprite {
                 image: handle.clone(),
@@ -620,8 +661,7 @@ fn apply_render_scale(
         // the window at full resolution), NOT on the 3D camera whose render
         // target is the scaled-down image. This keeps UI text crisp.
         commands.spawn((
-            crate::WorldEntity,
-            crate::WorldScoped(world_id.0),
+            crate::UiOnly,
             RenderScaleBlit,
             Camera2d,
             Camera {
@@ -640,22 +680,10 @@ fn apply_render_scale(
         handle
     };
 
-    // Skip sprite/camera updates if the render target already exists at the right size.
-    if !needs_update {
-        return;
-    }
-
-    // Update the blit sprite size to match the current logical window dimensions.
-    let logical_size = Vec2::new(window.width(), window.height());
-    for entity in &blit_sprite_q {
-        commands.entity(entity).insert(Sprite {
-            image: image_handle.clone(),
-            custom_size: Some(logical_size),
-            ..default()
-        });
-    }
-
-    // Point the 3D camera at the render target image.
+    // Point the 3D camera at the render target image. Runs every frame (the
+    // matches! check is cheap) rather than only when needs_update: a fresh
+    // world camera spawned by a Play/Load reload must be retargeted even
+    // though the render target itself is unchanged.
     // NOTE: RenderTarget does NOT implement PartialEq. Always use pattern
     // matching (matches!, if let) to inspect variants. Direct == / !=
     // comparisons will not compile.
@@ -671,6 +699,21 @@ fn apply_render_scale(
             }));
         }
     }
+
+    // Skip sprite updates if the render target already exists at the right size.
+    if !needs_update {
+        return;
+    }
+
+    // Update the blit sprite size to match the current logical window dimensions.
+    let logical_size = Vec2::new(window.width(), window.height());
+    for entity in &blit_sprite_q {
+        commands.entity(entity).insert(Sprite {
+            image: image_handle.clone(),
+            custom_size: Some(logical_size),
+            ..default()
+        });
+    }
 }
 
 /// Reduces shadow quality when fps_120_mode is enabled to hit higher frame
@@ -682,6 +725,7 @@ fn apply_render_scale(
 /// when fps_120_mode == true.
 fn adapt_shadows_for_fps_mode(
     game_settings: Option<Res<crate::settings::GameSettings>>,
+    dev: Res<crate::dev_tools::DevSettings>,
     mut shadow_map: ResMut<DirectionalLightShadowMap>,
     mut sun_query: Query<&mut CascadeShadowConfig, With<SunMarker>>,
     mut lanterns: Query<&mut PointLight, With<LanternLight>>,
@@ -711,7 +755,7 @@ fn adapt_shadows_for_fps_mode(
 
         // Reduce lantern light range to cut per-pixel evaluations
         for mut light in &mut lanterns {
-            light.range = 8.0;
+            light.range = dev.lantern_radius * 0.66;
         }
     } else {
         // Restore full quality for 60 FPS mode
@@ -731,7 +775,7 @@ fn adapt_shadows_for_fps_mode(
         }
 
         for mut light in &mut lanterns {
-            light.range = 12.0;
+            light.range = dev.lantern_radius;
         }
     }
 }

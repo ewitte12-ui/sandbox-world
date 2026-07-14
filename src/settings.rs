@@ -66,8 +66,9 @@ pub struct GameSettings {
     #[serde(default)]
     pub block_textures: HashMap<String, String>,
     /// User-defined custom block types. Each entry occupies one atlas slot
-    /// starting at index 13 (after the built-in block types 0–12). The
-    /// current 4×4 atlas supports up to 3 custom blocks.
+    /// starting at CUSTOM_BLOCK_START (13, after the built-ins). Capacity
+    /// is MAX_CUSTOM_BLOCKS (51 with the current 8×8 atlas) — see
+    /// block_types.rs for the authoritative constants.
     #[serde(default)]
     pub custom_blocks: Vec<CustomBlockDef>,
 }
@@ -154,6 +155,19 @@ impl GameSettings {
         self.render_scale = self.render_scale.clamp(0.5, 1.0);
     }
 
+    /// True if sanitize() would modify any field. Checked (via immutable
+    /// deref) before calling sanitize() so the resource is only marked
+    /// changed when a value actually needs fixing — unconditionally calling
+    /// sanitize() re-marks GameSettings changed every frame, which keeps
+    /// every `settings.is_changed()`-gated system running forever (atlas
+    /// re-uploads, TAA resets, cascade rebuilds).
+    pub fn needs_sanitize(&self) -> bool {
+        self.render_scale.is_nan()
+            || self.render_scale.is_infinite()
+            || self.render_scale < 0.5
+            || self.render_scale > 1.0
+    }
+
     pub fn save(&self) {
         let path = Self::settings_path();
         if let Ok(data) = serde_json::to_string_pretty(self) {
@@ -178,5 +192,8 @@ impl Plugin for SettingsPlugin {
 }
 
 fn sanitize_settings(mut settings: ResMut<GameSettings>) {
-    settings.sanitize();
+    // Read via Deref (no change mark); only DerefMut when a fix is needed.
+    if settings.needs_sanitize() {
+        settings.sanitize();
+    }
 }

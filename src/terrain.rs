@@ -211,7 +211,16 @@ pub fn surface_block(x: i32, z: i32) -> BlockType {
 /// Diamond uses a separate noise sample (0.08 freq, offset by 100) so vein
 /// shapes are independent of the stone/dirt pattern.
 pub fn natural_block_at(x: i32, y: i32, z: i32) -> BlockType {
-    let sy = surface_y(x, z);
+    natural_block_at_with_surface(x, y, z, surface_y(x, z))
+}
+
+/// Same as `natural_block_at`, but takes a precomputed `surface_y(x, z)`.
+/// Chunk generation calls this with a per-column cached height — the
+/// surface height only depends on (x, z), so computing it per block
+/// (16× per column) wastes 7 octaves of FBM per call. The block-selection
+/// logic below is IDENTICAL to what natural_block_at always produced;
+/// only the redundant height recomputation is factored out.
+pub fn natural_block_at_with_surface(x: i32, y: i32, z: i32, sy: i32) -> BlockType {
     if y > sy {
         return BlockType::AIR;
     }
@@ -330,16 +339,23 @@ pub fn tree_at_grid(i: i32, j: i32) -> Option<(f32, f32, f32, f32)> {
 
 /// Place tree blocks into a chunk's block array during generation.
 /// Call this after filling natural blocks in Chunk::generate().
+///
+/// Returns a mask of boundary layers this pass wrote into, in
+/// ChunkNeighbors face order (-X, +X, -Y, +Y, -Z, +Z). A set bit means
+/// the chunk's outermost block layer on that side no longer matches pure
+/// terrain — neighbors that meshed against terrain-predicted padding for
+/// this chunk need a remesh (see handle_chunk_tasks).
 pub fn place_trees_in_chunk(
     blocks: &mut [BlockType; CHUNK_VOLUME],
     chunk_pos_x: i32,
     chunk_pos_y: i32,
     chunk_pos_z: i32,
-) {
+) -> [bool; 6] {
     let chunk_size = 16;
     let base_x = chunk_pos_x * chunk_size;
     let base_y = chunk_pos_y * chunk_size;
     let base_z = chunk_pos_z * chunk_size;
+    let mut boundary_mask = [false; 6];
 
     // Check a wide area of tree grid cells that could have trees overlapping this chunk
     let step: f32 = 18.0;
@@ -353,12 +369,18 @@ pub fn place_trees_in_chunk(
     for i in i_min..=i_max {
         for j in j_min..=j_max {
             if let Some((wx, wz, ground_y, scale)) = tree_at_grid(i, j) {
-                place_one_tree(blocks, base_x, base_y, base_z, wx, wz, ground_y, scale);
+                place_one_tree(
+                    blocks, base_x, base_y, base_z, wx, wz, ground_y, scale,
+                    &mut boundary_mask,
+                );
             }
         }
     }
+
+    boundary_mask
 }
 
+#[allow(clippy::too_many_arguments)]
 fn place_one_tree(
     blocks: &mut [BlockType; CHUNK_VOLUME],
     base_x: i32,
@@ -368,6 +390,7 @@ fn place_one_tree(
     wz: f32,
     ground_y: f32,
     scale: f32,
+    boundary_mask: &mut [bool; 6],
 ) {
     let chunk_size = 16;
     let tree_x = wx.floor() as i32;
@@ -380,6 +403,7 @@ fn place_one_tree(
         let wy = tree_base_y + dy;
         set_block_if_in_chunk(
             blocks, tree_x, wy, tree_z, base_x, base_y, base_z, chunk_size, BlockType::WOOD,
+            boundary_mask,
         );
     }
 
@@ -405,12 +429,14 @@ fn place_one_tree(
                 let bz = tree_z + dz;
                 set_block_if_in_chunk(
                     blocks, bx, cy, bz, base_x, base_y, base_z, chunk_size, BlockType::LEAVES,
+                    boundary_mask,
                 );
             }
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn set_block_if_in_chunk(
     blocks: &mut [BlockType; CHUNK_VOLUME],
     wx: i32,
@@ -421,6 +447,7 @@ fn set_block_if_in_chunk(
     base_z: i32,
     chunk_size: i32,
     block: BlockType,
+    boundary_mask: &mut [bool; 6],
 ) {
     let lx = wx - base_x;
     let ly = wy - base_y;
@@ -430,6 +457,13 @@ fn set_block_if_in_chunk(
         // Only place into air blocks (don't overwrite terrain)
         if blocks[idx] == BlockType::AIR {
             blocks[idx] = block;
+            // Track writes to the outermost layers (ChunkNeighbors order).
+            if lx == 0 { boundary_mask[0] = true; }
+            if lx == chunk_size - 1 { boundary_mask[1] = true; }
+            if ly == 0 { boundary_mask[2] = true; }
+            if ly == chunk_size - 1 { boundary_mask[3] = true; }
+            if lz == 0 { boundary_mask[4] = true; }
+            if lz == chunk_size - 1 { boundary_mask[5] = true; }
         }
     }
 }
