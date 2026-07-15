@@ -9,7 +9,6 @@ use block_mesh::{
 use std::collections::{HashMap, HashSet};
 
 use crate::block_types::BlockType;
-use crate::chunk_manager::{ATLAS_TILES_PER_ROW};
 use crate::terrain::place_trees_in_chunk;
 
 /// Debug: set to true by build_mesh if a greedy meshing invariant is violated.
@@ -91,7 +90,13 @@ impl Chunk {
             }
         }
 
-        let boundary_mask = place_trees_in_chunk(&mut blocks, pos.0, pos.1, pos.2);
+        let tree_mask = place_trees_in_chunk(&mut blocks, pos.0, pos.1, pos.2);
+        // Buildings AFTER trees: legacy building modifications overrode
+        // generated chunk content, so buildings must win over tree blocks.
+        let building_mask =
+            crate::buildings::place_buildings_in_chunk(&mut blocks, pos.0, pos.1, pos.2);
+        let boundary_mask: [bool; 6] =
+            std::array::from_fn(|i| tree_mask[i] || building_mask[i]);
 
         (Chunk { blocks, pos }, boundary_mask)
     }
@@ -109,10 +114,12 @@ impl Chunk {
     ///
     /// RENDERING NOTE: all vertex positions are in float chunk-local space
     /// (0.0..16.0). The chunk's world offset is applied via Transform in
-    /// handle_chunk_tasks. UVs map into a texture atlas using float division
-    /// (tile_uv_size = 1/ATLAS_TILES_PER_ROW; 0.125 for the current 8×8
-    /// atlas). Per-vertex color carries face brightness × baked ambient
-    /// occlusion (see vertex_ao / ao_strength).
+    /// handle_chunk_tasks. UV_0 is tile-local (0..1 per block face, 0..w
+    /// along greedy-merged runs — sampled with a repeating sampler);
+    /// UV_1.x carries the block's texture-array layer index, constant per
+    /// quad (see chunk_manager::BlockArrayExtension). Per-vertex color
+    /// carries face brightness × baked ambient occlusion (vertex_ao /
+    /// ao_strength).
     pub fn build_mesh(
         &self,
         neighbors: &ChunkNeighbors,
@@ -163,30 +170,66 @@ impl Chunk {
             let base_x = self.pos.0 * CHUNK_SIZE;
             let base_y = self.pos.1 * CHUNK_SIZE;
             let base_z = self.pos.2 * CHUNK_SIZE;
-            let mut col_surface = [[0i32; 18]; 18];
-            for (pz, row) in col_surface.iter_mut().enumerate() {
-                for (px, slot) in row.iter_mut().enumerate() {
-                    *slot = crate::terrain::surface_y(
+            // Lazily computed per-column surface heights (i32::MIN = unset).
+            let mut col_surface = [[i32::MIN; 18]; 18];
+            fn surface_at(
+                cache: &mut [[i32; 18]; 18],
+                base_x: i32,
+                base_z: i32,
+                px: usize,
+                pz: usize,
+            ) -> i32 {
+                if cache[pz][px] == i32::MIN {
+                    cache[pz][px] = crate::terrain::surface_y(
                         base_x + px as i32 - 1,
                         base_z + pz as i32 - 1,
                     );
                 }
+                cache[pz][px]
             }
+            let have_neighbor = [
+                neighbors.neighbors[0].is_some(),
+                neighbors.neighbors[1].is_some(),
+                neighbors.neighbors[2].is_some(),
+                neighbors.neighbors[3].is_some(),
+                neighbors.neighbors[4].is_some(),
+                neighbors.neighbors[5].is_some(),
+            ];
             for pz in 0..18u32 {
                 for py in 0..18u32 {
                     for px in 0..18u32 {
-                        let on_shell = px == 0 || px == 17
-                            || py == 0 || py == 17
-                            || pz == 0 || pz == 17;
-                        if !on_shell {
-                            continue;
+                        let sx = px == 0 || px == 17;
+                        let sy = py == 0 || py == 17;
+                        let sz = pz == 0 || pz == 17;
+                        let shell_axes = sx as u8 + sy as u8 + sz as u8;
+                        if shell_axes == 0 {
+                            continue; // interior
                         }
+                        // Face-interior cells (exactly one shell axis) of a
+                        // LOADED neighbor's slab are fully overwritten by
+                        // real data below — skip the terrain prediction.
+                        // Edge/corner cells (≥2 shell axes) are never
+                        // covered by face neighbors and always need it
+                        // (AO samples diagonals).
+                        if shell_axes == 1 {
+                            let face = if px == 0 { 0 }
+                                else if px == 17 { 1 }
+                                else if py == 0 { 2 }
+                                else if py == 17 { 3 }
+                                else if pz == 0 { 4 }
+                                else { 5 };
+                            if have_neighbor[face] {
+                                continue;
+                            }
+                        }
+                        let sy_col =
+                            surface_at(&mut col_surface, base_x, base_z, px as usize, pz as usize);
                         let pi = PaddedChunkShape::linearize([px, py, pz]);
                         padded[pi as usize] = crate::terrain::natural_block_at_with_surface(
                             base_x + px as i32 - 1,
                             base_y + py as i32 - 1,
                             base_z + pz as i32 - 1,
-                            col_surface[pz as usize][px as usize],
+                            sy_col,
                         );
                     }
                 }
@@ -259,9 +302,8 @@ impl Chunk {
             "BlockType::AIR must not be opaque — boundary faces depend on this"
         );
 
-        // Per-block face culling (not greedy meshing). Greedy meshing would
-        // merge adjacent same-type faces into larger quads for fewer draw calls,
-        // but would break per-block atlas UV mapping and the grid border effect.
+        // Per-block visible-face collection. The greedy branch below merges
+        // same-type/same-AO runs of these unit faces into wider quads.
         let mut buffer = UnitQuadBuffer::new();
         visible_block_faces(
             &padded,
@@ -277,23 +319,9 @@ impl Chunk {
         let mut normals: Vec<[f32; 3]> = Vec::new();
         let mut colors: Vec<[f32; 4]> = Vec::new();
         let mut uvs: Vec<[f32; 2]> = Vec::new();
+        // UV_1.x = texture-array layer (block type index), constant per quad.
+        let mut layer_uvs: Vec<[f32; 2]> = Vec::new();
         let mut indices: Vec<u32> = Vec::new();
-
-        let tiles_per_row = ATLAS_TILES_PER_ROW;
-        let tile_uv_size = 1.0 / tiles_per_row as f32;
-
-        // Inset each tile's UV range so the Linear sampler's 2×2 blend
-        // never reaches across a tile boundary into a neighbor block's
-        // pixels. The mip chain is built per-tile (no cumulative bleed
-        // in the mip data itself — see generate_atlas_mip_chain), so
-        // the inset only has to cover one Linear blend at the smallest
-        // mip we actually generate. At min_atlas_size = 32 (each tile
-        // = 4 px), one texel UV = 1/32 ≈ 3.1% of tile_uv_size. A 3%
-        // inset covers the half-texel at every mip from there up, and
-        // the close-up visual loss (≈6% trim across each tile axis) is
-        // imperceptible against the procedural block textures.
-        let uv_inset = tile_uv_size * 0.03;
-        let tile_span = tile_uv_size - 2.0 * uv_inset;
 
         // --- Vertex ambient occlusion -----------------------------------
         // Classic voxel AO ("0fps" formulation): for each face vertex,
@@ -352,10 +380,10 @@ impl Chunk {
         // `corners` are 4 face corners in padded space, in ANY order — the
         // helper classifies them into ring order on (ax_u, ax_v), fixes
         // winding against `normal`, and picks the triangulation diagonal
-        // from per-corner AO (split along the brighter diagonal so a dark
-        // corner reads as a crease instead of an X artifact). `ao` holds
-        // final brightness multipliers aligned with `corners`.
-        let emit_quad = |
+        // from per-corner AO (split along the DARKER diagonal so the
+        // crease passes through the dark corner instead of an X artifact).
+        // `ao` holds final brightness multipliers aligned with `corners`.
+        let mut emit_quad = |
             positions: &mut Vec<[f32; 3]>,
             normals: &mut Vec<[f32; 3]>,
             colors: &mut Vec<[f32; 4]>,
@@ -365,8 +393,7 @@ impl Chunk {
             ao: [f32; 4],
             normal: [f32; 3],
             face_brightness: f32,
-            tile_u0: f32,
-            tile_v0: f32,
+            layer: f32,
             ax_u: usize,
             ax_v: usize,
         | {
@@ -383,16 +410,13 @@ impl Chunk {
             }
             for (c, a) in corners.iter().zip(ao.iter()) {
                 positions.push([c[0] - 1.0, c[1] - 1.0, c[2] - 1.0]);
-                // Tiled UVs: each block-sized cell maps to the full atlas tile.
-                // The inset shrinks the per-tile [0, tile_uv_size] range to
-                // [inset, tile_uv_size - inset] so Linear filtering never
-                // reaches into the neighboring atlas tile.
+                // Tile-local UVs: 0..1 per block cell, 0..w across a greedy
+                // run. The repeating sampler tiles the block's array layer
+                // across merged quads — no atlas offset, no inset.
                 let lu = c[ax_u] - min_u;
                 let lv = c[ax_v] - min_v;
-                uvs.push([
-                    tile_u0 + uv_inset + lu * tile_span,
-                    tile_v0 + uv_inset + lv * tile_span,
-                ]);
+                uvs.push([lu, lv]);
+                layer_uvs.push([layer, 0.0]);
                 normals.push(normal);
                 let b = face_brightness * a;
                 colors.push([b, b, b, 1.0]);
@@ -431,7 +455,7 @@ impl Chunk {
             if cross[0] * normal[0] + cross[1] * normal[1] + cross[2] * normal[2] < 0.0 {
                 ring.swap(1, 3);
             }
-            // AO diagonal flip: split along the brighter diagonal.
+            // AO diagonal flip: split along the darker (lower-sum) diagonal.
             let tris = if ao[ring[0]] + ao[ring[2]] > ao[ring[1]] + ao[ring[3]] {
                 [ring[1], ring[2], ring[3], ring[1], ring[3], ring[0]]
             } else {
@@ -473,11 +497,7 @@ impl Chunk {
                 for unit_quad in group.iter() {
                     let quad = block_mesh::UnorientedQuad::from(*unit_quad);
                     let voxel = padded[PaddedChunkShape::linearize(unit_quad.minimum) as usize];
-                    let block_idx = voxel.index() as u32;
-                    let tile_x = block_idx % tiles_per_row;
-                    let tile_y = block_idx / tiles_per_row;
-                    let tile_u0 = tile_x as f32 * tile_uv_size;
-                    let tile_v0 = tile_y as f32 * tile_uv_size;
+                    let layer = voxel.index() as f32;
                     let mesh_positions = face.quad_mesh_positions(&quad, 1.0);
 
                     let mut min_pos = mesh_positions[0];
@@ -501,7 +521,7 @@ impl Chunk {
                         &mut positions, &mut normals, &mut colors, &mut uvs, &mut indices,
                         [mesh_positions[0], mesh_positions[1], mesh_positions[2], mesh_positions[3]],
                         ao, normal_arr, face_brightness,
-                        tile_u0, tile_v0, ax_u, ax_v,
+                        layer, ax_u, ax_v,
                     );
                 }
             } else {
@@ -533,9 +553,6 @@ impl Chunk {
                     if voxel.is_emissive() || !voxel.is_opaque() {
                         // Emit as a single 1×1 quad.
                         let quad = block_mesh::UnorientedQuad::from(*unit_quad);
-                        let block_idx = voxel.index() as u32;
-                        let tile_x = block_idx % tiles_per_row;
-                        let tile_y = block_idx / tiles_per_row;
                         let mesh_positions = face.quad_mesh_positions(&quad, 1.0);
                         // Classify corners against the face midpoint so the
                         // AO values align with block_mesh's vertex order.
@@ -563,7 +580,7 @@ impl Chunk {
                             &mut positions, &mut normals, &mut colors, &mut uvs, &mut indices,
                             [mesh_positions[0], mesh_positions[1], mesh_positions[2], mesh_positions[3]],
                             ao, normal_arr, face_brightness,
-                            tile_x as f32 * tile_uv_size, tile_y as f32 * tile_uv_size,
+                            voxel.index() as f32,
                             ax_u, ax_v,
                         );
                         continue;
@@ -648,11 +665,6 @@ impl Chunk {
                                 greedy_covered.insert((_slice, u, _v));
                             }
                         }
-                        let block_idx = block.index() as u32;
-                        let tile_x = block_idx % tiles_per_row;
-                        let tile_y = block_idx / tiles_per_row;
-                        let tile_u0 = tile_x as f32 * tile_uv_size;
-                        let tile_v0 = tile_y as f32 * tile_uv_size;
 
                         // Build corner positions in padded space.
                         let mut c0 = [0.0f32; 3];
@@ -696,7 +708,7 @@ impl Chunk {
                             &mut positions, &mut normals, &mut colors, &mut uvs, &mut indices,
                             [c0, c1, c2, c3],
                             ao, normal_arr, greedy_brightness,
-                            tile_u0, tile_v0,
+                            block.index() as f32,
                             ax_u, ax_v,
                         );
                         // Override colors for highlighted greedy quads.
@@ -847,6 +859,9 @@ impl Chunk {
             debug_assert_eq!(vert_count, colors.len(),
                 "Chunk ({},{},{}): {} positions vs {} colors",
                 self.pos.0, self.pos.1, self.pos.2, vert_count, colors.len());
+            debug_assert_eq!(vert_count, layer_uvs.len(),
+                "Chunk ({},{},{}): {} positions vs {} layer UVs",
+                self.pos.0, self.pos.1, self.pos.2, vert_count, layer_uvs.len());
         }
 
         let mut mesh = Mesh::new(
@@ -857,6 +872,7 @@ impl Chunk {
         mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
         mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
         mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+        mesh.insert_attribute(Mesh::ATTRIBUTE_UV_1, layer_uvs);
         mesh.insert_indices(Indices::U32(indices));
         mesh
     }
@@ -969,6 +985,52 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Buildings must be baked into generated chunks exactly like the
+    /// legacy modification-based placement: WOOD walls, STONE roof, a
+    /// 4-wide door opening, interior left as terrain.
+    #[test]
+    fn building_is_baked_into_chunks() {
+        use crate::terrain::surface_y;
+        // Spot (50, 30): origin corner (45, 25), base at surface+1.
+        let base_y = surface_y(50, 30) + 1;
+        let (bx0, bz0) = (45, 25);
+
+        let block_at_world = |wx: i32, wy: i32, wz: i32| -> BlockType {
+            let cp = ChunkPos(
+                wx.div_euclid(CHUNK_SIZE),
+                wy.div_euclid(CHUNK_SIZE),
+                wz.div_euclid(CHUNK_SIZE),
+            );
+            let chunk = Chunk::generate(cp);
+            chunk.get_block(
+                wx.rem_euclid(CHUNK_SIZE),
+                wy.rem_euclid(CHUNK_SIZE),
+                wz.rem_euclid(CHUNK_SIZE),
+            )
+        };
+
+        // Roof (dy=6) is stone everywhere on the footprint.
+        assert_eq!(block_at_world(bx0, base_y + 6, bz0), BlockType::STONE);
+        assert_eq!(block_at_world(bx0 + 9, base_y + 6, bz0 + 9), BlockType::STONE);
+        // Wall corners are wood below the roof.
+        assert_eq!(block_at_world(bx0, base_y, bz0), BlockType::WOOD);
+        assert_eq!(block_at_world(bx0 + 9, base_y + 2, bz0 + 9), BlockType::WOOD);
+        // Door opening: dz=0, dx in 3..=6, dy<5 — must NOT be wall material.
+        for dx in 3..=6 {
+            let b = block_at_world(bx0 + dx, base_y + 1, bz0);
+            assert_ne!(b, BlockType::WOOD, "door blocked at dx={dx}");
+            assert_ne!(b, BlockType::STONE, "door blocked at dx={dx}");
+        }
+        // The building spans chunk x=2/x=3 (blocks 45..54 cross x=48):
+        // both sides must report a boundary-divergent face there.
+        let cy = base_y.div_euclid(CHUNK_SIZE);
+        let cz = bz0.div_euclid(CHUNK_SIZE);
+        let (_, mask_left) = Chunk::generate_tracked(ChunkPos(2, cy, cz));
+        let (_, mask_right) = Chunk::generate_tracked(ChunkPos(3, cy, cz));
+        assert!(mask_left[1], "left chunk +X face should be divergent");
+        assert!(mask_right[0], "right chunk -X face should be divergent");
     }
 
     /// generate() and generate_tracked() must agree, and the boundary mask

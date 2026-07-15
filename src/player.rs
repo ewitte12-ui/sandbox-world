@@ -29,58 +29,28 @@ fn inventory_closed(inv_state: Option<Res<InventoryState>>) -> bool {
 // Save restore
 // ---------------------------------------------------------------------------
 
-/// Load player state from the save file. Returns the restored Player and
-/// position. If no save exists, returns defaults (new game at origin).
+/// Load player state from the default save (any format — save_load sniffs
+/// by content). Returns the restored Player and position. If no save or
+/// no player snapshot exists, returns defaults (new game at origin).
 fn load_player_from_save() -> (Player, Vec3) {
-    let save_path = dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".metalworld_save.json");
-
-    let Ok(data) = std::fs::read_to_string(&save_path) else {
+    let Some(state) = crate::save_load::read_default_save().and_then(|s| s.player) else {
         #[cfg(debug_assertions)]
-        bevy::log::info!("No save file — starting new game at default position");
+        bevy::log::info!("No save/player snapshot — starting new game at default position");
         return (Player::default(), Vec3::new(0.0, 20.0, 0.0));
     };
-
-    // Partial deserialize — only the fields we need.
-    #[derive(serde::Deserialize)]
-    struct PartialSave {
-        #[serde(default)]
-        player_position: Option<[f32; 3]>,
-        #[serde(default)]
-        player_yaw: Option<f32>,
-        #[serde(default)]
-        player_pitch: Option<f32>,
-        #[serde(default)]
-        home_position: Option<[f32; 3]>,
-    }
-
-    let Ok(save) = serde_json::from_str::<PartialSave>(&data) else {
-        #[cfg(debug_assertions)]
-        bevy::log::warn!("Failed to parse save file — starting at default position");
-        return (Player::default(), Vec3::new(0.0, 20.0, 0.0));
-    };
-
-    let pos = save.player_position
-        .map(Vec3::from_array)
-        .unwrap_or(Vec3::new(0.0, 20.0, 0.0));
 
     let mut player = Player::default();
-    if let Some(yaw) = save.player_yaw {
-        player.yaw = yaw;
-    }
-    if let Some(pitch) = save.player_pitch {
-        player.pitch = pitch;
-    }
-    player.home_position = save.home_position.map(Vec3::from_array);
+    player.yaw = state.yaw;
+    player.pitch = state.pitch;
+    player.home_position = state.home_position;
 
     #[cfg(debug_assertions)]
     bevy::log::info!(
         "Restored player from save: pos=({:.1},{:.1},{:.1}) yaw={:.2} pitch={:.2}",
-        pos.x, pos.y, pos.z, player.yaw, player.pitch,
+        state.position.x, state.position.y, state.position.z, player.yaw, player.pitch,
     );
 
-    (player, pos)
+    (player, state.position)
 }
 
 // ---------------------------------------------------------------------------

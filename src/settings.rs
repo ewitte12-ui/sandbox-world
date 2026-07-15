@@ -148,24 +148,22 @@ impl GameSettings {
     }
 
     /// Clamp and fix any out-of-range or invalid field values.
-    pub fn sanitize(&mut self) {
+    /// Returns true if anything was modified — the caller decides whether
+    /// to mark the resource changed. Keeping detection and repair in ONE
+    /// function means a future rule can't silently exist in one and not
+    /// the other.
+    pub fn sanitize(&mut self) -> bool {
+        let mut changed = false;
         if self.render_scale.is_nan() || self.render_scale.is_infinite() {
             self.render_scale = 1.0;
+            changed = true;
         }
-        self.render_scale = self.render_scale.clamp(0.5, 1.0);
-    }
-
-    /// True if sanitize() would modify any field. Checked (via immutable
-    /// deref) before calling sanitize() so the resource is only marked
-    /// changed when a value actually needs fixing — unconditionally calling
-    /// sanitize() re-marks GameSettings changed every frame, which keeps
-    /// every `settings.is_changed()`-gated system running forever (atlas
-    /// re-uploads, TAA resets, cascade rebuilds).
-    pub fn needs_sanitize(&self) -> bool {
-        self.render_scale.is_nan()
-            || self.render_scale.is_infinite()
-            || self.render_scale < 0.5
-            || self.render_scale > 1.0
+        let clamped = self.render_scale.clamp(0.5, 1.0);
+        if clamped != self.render_scale {
+            self.render_scale = clamped;
+            changed = true;
+        }
+        changed
     }
 
     pub fn save(&self) {
@@ -192,8 +190,11 @@ impl Plugin for SettingsPlugin {
 }
 
 fn sanitize_settings(mut settings: ResMut<GameSettings>) {
-    // Read via Deref (no change mark); only DerefMut when a fix is needed.
-    if settings.needs_sanitize() {
-        settings.sanitize();
+    // bypass_change_detection: sanitize() must not re-mark the resource
+    // changed on every run (that feedback loop kept every
+    // settings.is_changed()-gated system firing per frame — atlas GPU
+    // re-uploads, TAA resets). Mark manually only when a value was fixed.
+    if settings.bypass_change_detection().sanitize() {
+        settings.set_changed();
     }
 }

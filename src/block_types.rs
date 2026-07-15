@@ -4,23 +4,21 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 // ---------------------------------------------------------------------------
-// Authoritative block capacity constant. Every atlas size, registry limit,
-// and tile loop derives from this single value.
+// Authoritative block capacity constant. The block texture is a 2D array
+// with exactly this many layers (one per block type); the registry limit
+// and every block index derive from this single value.
 // ---------------------------------------------------------------------------
 
 /// Maximum number of distinct block types (built-in + custom).
-/// The texture atlas is sized to hold exactly this many tiles.
-/// All block-count-dependent structures derive from this single value.
+/// The block texture array has exactly this many layers.
+/// A block's `index()` is its texture-array layer, so this also bounds the
+/// layer count (see chunk_manager::BLOCK_LAYER_COUNT).
 pub const MAX_BLOCK_TYPES: u8 = 64;
-
-/// Number of tiles per row/column in the atlas. Computed so that
-/// tiles_per_row² >= MAX_BLOCK_TYPES (8×8 = 64).
-pub const ATLAS_TILES_PER_ROW: u32 = 8;
 
 /// Number of built-in (non-custom) block types (Air through StoneBrick).
 pub const BUILTIN_BLOCK_COUNT: u8 = 13;
 
-/// First atlas index available for user-created custom blocks.
+/// First layer index available for user-created custom blocks.
 pub const CUSTOM_BLOCK_START: u8 = BUILTIN_BLOCK_COUNT;
 
 /// Maximum number of custom blocks (total capacity minus built-in).
@@ -28,10 +26,6 @@ pub const MAX_CUSTOM_BLOCKS: usize = (MAX_BLOCK_TYPES - CUSTOM_BLOCK_START) as u
 
 // Compile-time safety checks — these prevent silent breakage if constants
 // are changed without updating dependent values.
-const _: () = assert!(
-    (ATLAS_TILES_PER_ROW * ATLAS_TILES_PER_ROW) as u8 >= MAX_BLOCK_TYPES,
-    "ATLAS_TILES_PER_ROW² must be >= MAX_BLOCK_TYPES"
-);
 const _: () = assert!(
     CUSTOM_BLOCK_START < MAX_BLOCK_TYPES,
     "CUSTOM_BLOCK_START must be less than MAX_BLOCK_TYPES"

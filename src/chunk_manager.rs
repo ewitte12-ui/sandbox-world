@@ -2,7 +2,10 @@ use std::collections::{HashMap, HashSet};
 
 use bevy::{
     asset::RenderAssetUsages,
+    pbr::{ExtendedMaterial, MaterialExtension},
     prelude::*,
+    render::render_resource::AsBindGroup,
+    shader::ShaderRef,
     tasks::{futures::check_ready, AsyncComputeTaskPool, Task},
 };
 
@@ -13,25 +16,58 @@ use crate::terrain::natural_block_at;
 /// Default render distance in chunks (5 chunks = 80 blocks radius).
 pub const DEFAULT_RENDER_DISTANCE: i32 = 5;
 
-/// Re-export atlas layout from block_types (the single source of truth).
-pub use crate::block_types::ATLAS_TILES_PER_ROW;
+/// Number of layers in the block texture array — one per block type.
+pub const BLOCK_LAYER_COUNT: u32 = crate::block_types::MAX_BLOCK_TYPES as u32;
 
-/// Shared material handle for all chunk meshes (with grid texture).
-#[derive(Resource)]
-pub struct ChunkMaterial {
-    pub handle: Handle<StandardMaterial>,
+/// StandardMaterial extension that samples base color from a 2D array
+/// texture (one layer per block type) instead of a tiled atlas. The mesh
+/// supplies the layer index in UV_1.x (see chunk.rs build_mesh) and the
+/// fragment shader (assets/shaders/block_array.wgsl) does the array
+/// sample, plus per-layer emissive gating for the lantern.
+///
+/// WHY an array over the old atlas: no UV-inset bleed hacks, correct
+/// per-layer hardware-addressable mips, and UV repeat on greedy-merged
+/// quads — which a shared atlas cannot express.
+#[derive(Asset, AsBindGroup, Reflect, Debug, Clone)]
+pub struct BlockArrayExtension {
+    // Extension bindings start at 100 (0-99 reserved for StandardMaterial).
+    #[texture(100, dimension = "2d_array")]
+    #[sampler(101)]
+    pub layers: Handle<Image>,
 }
 
-/// Resource holding the texture atlas image handle so tiles can be updated at runtime.
+impl MaterialExtension for BlockArrayExtension {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/block_array.wgsl".into()
+    }
+}
+
+/// The concrete chunk material type: full PBR pipeline (fog, shadows,
+/// tonemapping) with the array-texture base color swap.
+pub type BlockArrayMaterial = ExtendedMaterial<StandardMaterial, BlockArrayExtension>;
+
+/// Shared material handle for all chunk meshes.
+#[derive(Resource)]
+pub struct ChunkMaterial {
+    pub handle: Handle<BlockArrayMaterial>,
+}
+
+/// Resource holding the block layer-array image so layers can be updated
+/// at runtime (texture menu). Data layout is LAYER-MAJOR (matching
+/// `TextureDataOrder::LayerMajor`): each layer's full mip chain is
+/// contiguous, so a runtime tile update rewrites one layer's slice and
+/// regenerates only that layer's mips.
 #[derive(Resource)]
 pub struct BlockAtlas {
     pub image_handle: Handle<Image>,
     /// Tracks which block types have a loaded PNG texture (by u8 index).
     pub loaded_textures: HashSet<u8>,
-    /// Current tile size in pixels.
+    /// Current tile (layer) size in pixels. Always a power of two.
     pub tile_size: u32,
-    /// Total atlas size in pixels.
-    pub atlas_size: u32,
+    /// Mip levels per layer (down to 1×1).
+    pub mip_count: u32,
+    /// Anisotropic filtering level the sampler was last built with.
+    pub aniso: u16,
 }
 
 /// Marker component for chunk entities in the world.
@@ -210,6 +246,12 @@ impl ChunkManager {
         }
     }
 
+    /// True when no generation tasks are in flight and no remesh work is
+    /// queued — used by the dev screenshot harness to wait for a fully
+    /// streamed-in world before capturing.
+    pub fn streaming_idle(&self) -> bool {
+        self.pending.is_empty() && self.dirty_chunks.is_empty() && self.deferred_remesh.is_empty()
+    }
 }
 
 /// Convert a world-space position to chunk coordinates.
@@ -236,15 +278,18 @@ pub struct ChunkManagerPlugin;
 impl Plugin for ChunkManagerPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ChunkManager>()
+            // Registers the chunk material type (StandardMaterial extended
+            // with the block layer-array sampler).
+            .add_plugins(MaterialPlugin::<BlockArrayMaterial>::default())
             .add_systems(Startup, setup_chunk_material)
             // ORDERING CONTRACT: chained because each stage depends on the previous:
             //   1. load_chunks           — spawns async gen tasks for missing chunks
             //   2. handle_chunk_tasks    — polls completed tasks, inserts chunk data + mesh
             //   3. remesh_dirty_chunks   — rebuilds meshes for modified chunks
             //   4. unload_chunks         — despawns chunks beyond render distance
-            //   5. apply_texture_size_change — rebuilds atlas if texture size changed
-            //   6. apply_aniso_filter_change — updates sampler if filter setting changed
-            // Steps 5-6 must run after meshing so new meshes get the correct material.
+            //   5. apply_texture_settings_change — rebuilds layers on texture_size
+            //      change, swaps sampler on anisotropy change
+            // Step 5 must run after meshing so new meshes get the correct material.
             .add_systems(
                 Update,
                 (
@@ -253,8 +298,7 @@ impl Plugin for ChunkManagerPlugin {
                     handle_chunk_tasks,
                     remesh_dirty_chunks,
                     unload_chunks,
-                    apply_texture_size_change,
-                    apply_aniso_filter_change,
+                    apply_texture_settings_change,
                 )
                     .chain()
                     .run_if(in_state(crate::GameState::Gameplay)),
@@ -277,17 +321,46 @@ fn on_block_registry_changed(
     }
 }
 
-/// Fill a single tile in the atlas data with a solid color + grid border.
-pub fn fill_atlas_tile(data: &mut [u8], block_idx: u8, color: Color, tile_size: u32, atlas_width: u32) {
-    if block_idx >= crate::block_types::MAX_BLOCK_TYPES {
+// ---------------------------------------------------------------------------
+// Layer-array data layout (LAYER-MAJOR: per-layer contiguous mip chains)
+// ---------------------------------------------------------------------------
+
+/// Normalize a requested tile size to a power of two in [64, 512]
+/// (rounds down) so the mip chain divides cleanly to 1×1.
+pub fn normalize_tile_size(size: u32) -> u32 {
+    let s = size.clamp(64, 512);
+    1 << (31 - s.leading_zeros())
+}
+
+/// Mip levels for a power-of-two tile, down to 1×1 (64 px → 7 levels).
+pub fn mip_count_for(tile_size: u32) -> u32 {
+    tile_size.trailing_zeros() + 1
+}
+
+/// Bytes of one layer's full mip chain.
+fn layer_chain_bytes(tile_size: u32, mip_count: u32) -> usize {
+    (0..mip_count)
+        .map(|m| {
+            let s = (tile_size >> m).max(1);
+            (s * s * 4) as usize
+        })
+        .sum()
+}
+
+/// Write a solid color + darkened 3 px grid border into a layer's mip 0,
+/// then regenerate that layer's mip chain.
+pub fn write_layer_solid(
+    data: &mut [u8],
+    layer: u8,
+    color: Color,
+    tile_size: u32,
+    mip_count: u32,
+) {
+    if layer as u32 >= BLOCK_LAYER_COUNT {
         return;
     }
-    let tiles_per_row = ATLAS_TILES_PER_ROW;
-
-    let tile_x = (block_idx as u32) % tiles_per_row;
-    let tile_y = (block_idx as u32) / tiles_per_row;
-    let base_px = tile_x * tile_size;
-    let base_py = tile_y * tile_size;
+    let chain = layer_chain_bytes(tile_size, mip_count);
+    let slice = &mut data[layer as usize * chain..(layer as usize + 1) * chain];
 
     let LinearRgba { red, green, blue, alpha } = color.to_linear();
     // Convert linear to sRGB for Rgba8UnormSrgb storage
@@ -297,27 +370,109 @@ pub fn fill_atlas_tile(data: &mut [u8], block_idx: u8, color: Color, tile_size: 
     let a = (alpha * 255.0) as u8;
 
     let border = 3u32;
-
     for py in 0..tile_size {
         for px in 0..tile_size {
             let is_border = px < border || px >= tile_size - border
                 || py < border || py >= tile_size - border;
-            let ix = base_px + px;
-            let iy = base_py + py;
-            let i = ((iy * atlas_width + ix) * 4) as usize;
+            let i = ((py * tile_size + px) * 4) as usize;
             if is_border {
                 // Subtle darkened border
-                data[i] = ((r as f32) * 0.65) as u8;
-                data[i + 1] = ((g as f32) * 0.65) as u8;
-                data[i + 2] = ((b as f32) * 0.65) as u8;
-                data[i + 3] = a;
+                slice[i] = ((r as f32) * 0.65) as u8;
+                slice[i + 1] = ((g as f32) * 0.65) as u8;
+                slice[i + 2] = ((b as f32) * 0.65) as u8;
+                slice[i + 3] = a;
             } else {
-                data[i] = r;
-                data[i + 1] = g;
-                data[i + 2] = b;
-                data[i + 3] = a;
+                slice[i] = r;
+                slice[i + 1] = g;
+                slice[i + 2] = b;
+                slice[i + 3] = a;
             }
         }
+    }
+    regenerate_layer_mips(slice, tile_size, mip_count);
+}
+
+/// Copy RGBA8 pixel data (tile_size²) into a layer's mip 0 with the
+/// darkened 3 px border, then regenerate that layer's mip chain.
+pub fn write_layer_rgba(
+    data: &mut [u8],
+    layer: u8,
+    rgba: &image::RgbaImage,
+    tile_size: u32,
+    mip_count: u32,
+) {
+    if layer as u32 >= BLOCK_LAYER_COUNT {
+        return;
+    }
+    let chain = layer_chain_bytes(tile_size, mip_count);
+    let slice = &mut data[layer as usize * chain..(layer as usize + 1) * chain];
+
+    let border = 3u32;
+    for py in 0..tile_size {
+        for px in 0..tile_size {
+            let i = ((py * tile_size + px) * 4) as usize;
+            let src = rgba.get_pixel(px, py);
+            let is_border = px < border || px >= tile_size - border
+                || py < border || py >= tile_size - border;
+            if is_border {
+                slice[i] = ((src[0] as f32) * 0.65) as u8;
+                slice[i + 1] = ((src[1] as f32) * 0.65) as u8;
+                slice[i + 2] = ((src[2] as f32) * 0.65) as u8;
+                slice[i + 3] = src[3];
+            } else {
+                slice[i] = src[0];
+                slice[i + 1] = src[1];
+                slice[i + 2] = src[2];
+                slice[i + 3] = src[3];
+            }
+        }
+    }
+    regenerate_layer_mips(slice, tile_size, mip_count);
+}
+
+/// Rebuild mips 1..N of a single layer chain from its mip 0 by successive
+/// 2×2 box filtering in LINEAR space (naive sRGB averaging darkens).
+/// Chaining mip-from-previous-mip is exact here because a layer contains
+/// only its own block's texels — the cross-tile contamination that forced
+/// the old atlas to downsample every mip from mip 0 cannot happen.
+fn regenerate_layer_mips(layer_slice: &mut [u8], tile_size: u32, mip_count: u32) {
+    // sRGB-to-linear LUT for byte values 0..=255.
+    let mut srgb_to_lin = [0.0f32; 256];
+    for (i, slot) in srgb_to_lin.iter_mut().enumerate() {
+        let c = i as f32 / 255.0;
+        *slot = if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+    }
+
+    let mut src_offset = 0usize;
+    for m in 1..mip_count {
+        let src_size = (tile_size >> (m - 1)).max(1);
+        let dst_size = (tile_size >> m).max(1);
+        let dst_offset = src_offset + (src_size * src_size * 4) as usize;
+
+        for dy in 0..dst_size {
+            for dx in 0..dst_size {
+                let mut sum_rgb = [0.0f32; 3];
+                let mut sum_a: u32 = 0;
+                for sy in 0..2u32 {
+                    for sx in 0..2u32 {
+                        let s_x = (dx * 2 + sx).min(src_size - 1);
+                        let s_y = (dy * 2 + sy).min(src_size - 1);
+                        let si = src_offset + ((s_y * src_size + s_x) * 4) as usize;
+                        sum_rgb[0] += srgb_to_lin[layer_slice[si] as usize];
+                        sum_rgb[1] += srgb_to_lin[layer_slice[si + 1] as usize];
+                        sum_rgb[2] += srgb_to_lin[layer_slice[si + 2] as usize];
+                        sum_a += layer_slice[si + 3] as u32;
+                    }
+                }
+                let di = dst_offset + ((dy * dst_size + dx) * 4) as usize;
+                for c in 0..3 {
+                    layer_slice[di + c] =
+                        (linear_to_srgb(sum_rgb[c] * 0.25) * 255.0).round().clamp(0.0, 255.0) as u8;
+                }
+                layer_slice[di + 3] = ((sum_a as f32) * 0.25).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        src_offset = dst_offset;
     }
 }
 
@@ -330,67 +485,96 @@ fn linear_to_srgb(c: f32) -> f32 {
     }
 }
 
-/// Build the texture atlas and shared material for all chunk meshes.
+/// Build the block layer-array image and shared material for all chunk
+/// meshes. Single source of truth for layer content — the texture-size
+/// rebuild path calls the same builder (the old code had two ~150-line
+/// copies of the atlas fill that had already drifted).
 fn setup_chunk_material(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<BlockArrayMaterial>>,
     game_settings: Res<crate::settings::GameSettings>,
 ) {
-    use bevy::image::ImageSampler;
-    use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+    let tile_size = normalize_tile_size(game_settings.texture_size);
+    let (data, mip_count, loaded_textures) = build_layers_data(&game_settings, tile_size);
 
-    let tile_size = game_settings.texture_size.clamp(64, 512);
-    let atlas_size = ATLAS_TILES_PER_ROW * tile_size;
-    let mut data = vec![255u8; (atlas_size * atlas_size * 4) as usize];
+    let aniso = game_settings.anisotropic_filtering.max(1);
+    let image = make_layer_array_image(data, tile_size, mip_count, aniso);
+    let image_handle = images.add(image);
 
-    let all_blocks = [
-        BlockType::AIR,
-        BlockType::GRASS,
-        BlockType::DIRT,
-        BlockType::STONE,
-        BlockType::SAND,
-        BlockType::WOOD,
-        BlockType::DIAMOND,
-        BlockType::BEDROCK,
-        BlockType::LANTERN,
-        BlockType::BED,
-        BlockType::PILLOW,
-        BlockType::LEAVES,
-        BlockType::STONE_BRICK,
-    ];
+    let material = materials.add(BlockArrayMaterial {
+        base: StandardMaterial {
+            base_color: Color::WHITE,
+            // Warm lantern glow: the shader zeroes this for every layer
+            // except the lantern's (replaces the old emissive atlas).
+            emissive: bevy::color::LinearRgba::new(6.0, 5.1, 2.7, 1.0),
+            reflectance: 0.0,
+            ..default()
+        },
+        extension: BlockArrayExtension {
+            layers: image_handle.clone(),
+        },
+    });
 
-    for &block in &all_blocks {
-        fill_atlas_tile(&mut data, block.index(), block.color(), tile_size, atlas_size);
+    #[cfg(debug_assertions)]
+    {
+        let mat_valid = materials.get(&material).is_some();
+        let img_valid = images.get(&image_handle).is_some();
+        bevy::log::info!(
+            "Asset validation: material={} layer_array={} tile_size={} mips={} loaded_textures={}/{}",
+            if mat_valid { "OK" } else { "MISSING" },
+            if img_valid { "OK" } else { "MISSING" },
+            tile_size,
+            mip_count,
+            loaded_textures.len(),
+            crate::block_types::BUILTIN_BLOCK_COUNT,
+        );
+        debug_assert!(mat_valid, "Chunk material handle is invalid after creation");
+        debug_assert!(img_valid, "Layer-array image handle is invalid after creation");
+    }
+
+    commands.insert_resource(ChunkMaterial { handle: material });
+    commands.insert_resource(BlockAtlas {
+        image_handle,
+        loaded_textures,
+        tile_size,
+        mip_count,
+        aniso,
+    });
+}
+
+/// Build the full layer-major data blob for all block layers: solid colors
+/// + grid borders for every block type, overwritten by PNG textures where
+/// configured (settings paths first, then the textures/ dev directory).
+/// Returns (data, mip_count, loaded_texture_indices).
+fn build_layers_data(
+    settings: &crate::settings::GameSettings,
+    tile_size: u32,
+) -> (Vec<u8>, u32, HashSet<u8>) {
+    let mip_count = mip_count_for(tile_size);
+    let chain = layer_chain_bytes(tile_size, mip_count);
+    let mut data = vec![255u8; chain * BLOCK_LAYER_COUNT as usize];
+
+    for &block in &crate::block_types::ALL_BUILTIN_BLOCKS_WITH_AIR {
+        write_layer_solid(&mut data, block.index(), block.color(), tile_size, mip_count);
     }
     for idx in crate::block_types::CUSTOM_BLOCK_START..crate::block_types::MAX_BLOCK_TYPES {
-        fill_atlas_tile(&mut data, idx, Color::WHITE, tile_size, atlas_size);
+        write_layer_solid(&mut data, idx, Color::WHITE, tile_size, mip_count);
     }
 
     // Load block textures from two sources (settings path takes priority):
-    // 1. game_settings.block_textures — user-selected via the in-game file
-    //    dialog. This is the primary, user-facing workflow.
-    // 2. textures/ directory — developer convenience for bundled/default
-    //    textures. NOT a user-facing workflow; users should never need to
-    //    copy files here manually.
+    // 1. settings.block_textures — user-selected via the in-game file dialog.
+    // 2. textures/ directory — developer convenience for bundled defaults.
     let mut loaded_textures = HashSet::new();
-    for &block in &all_blocks {
-        if block == BlockType::AIR {
-            continue;
-        }
+    for &block in &crate::block_types::ALL_BUILTIN_BLOCKS {
         let name = block.name();
         let name_lower = name.to_lowercase();
-
-        // Check settings first (user-selected path from file dialog)
-        let settings_path = game_settings.block_textures.get(name);
-
-        // Try settings path, then fall back to textures/ directory
+        let settings_path = settings.block_textures.get(name);
         let try_paths: Vec<String> = if let Some(sp) = settings_path {
             vec![sp.clone(), format!("textures/{}.png", name_lower)]
         } else {
             vec![format!("textures/{}.png", name_lower)]
         };
-
         for tex_path in &try_paths {
             if let Ok(img_data) = std::fs::read(tex_path) {
                 if let Ok(dyn_img) = image::load_from_memory(&img_data) {
@@ -399,8 +583,7 @@ fn setup_chunk_material(
                         tile_size,
                         image::imageops::FilterType::Lanczos3,
                     );
-                    let rgba = resized.to_rgba8();
-                    copy_image_to_atlas_tile(&mut data, block.index(), &rgba, tile_size, atlas_size);
+                    write_layer_rgba(&mut data, block.index(), &resized.to_rgba8(), tile_size, mip_count);
                     loaded_textures.insert(block.index());
                     info!("Loaded texture: {} ({}x{})", tex_path, tile_size, tile_size);
                     break; // first successful source wins
@@ -409,9 +592,12 @@ fn setup_chunk_material(
         }
     }
 
-    // Load textures for custom blocks from their saved paths
-    for def in &game_settings.custom_blocks {
-        let idx = crate::block_types::CUSTOM_BLOCK_START + game_settings.custom_blocks.iter().position(|d| d.name == def.name).unwrap_or(0) as u8;
+    // Custom block textures from their saved paths.
+    for (slot, def) in settings.custom_blocks.iter().enumerate() {
+        let idx = crate::block_types::CUSTOM_BLOCK_START as usize + slot;
+        if idx >= crate::block_types::MAX_BLOCK_TYPES as usize {
+            break;
+        }
         if let Ok(img_data) = std::fs::read(&def.texture_path) {
             if let Ok(dyn_img) = image::load_from_memory(&img_data) {
                 let resized = dyn_img.resize_exact(
@@ -419,301 +605,54 @@ fn setup_chunk_material(
                     tile_size,
                     image::imageops::FilterType::Lanczos3,
                 );
-                let rgba = resized.to_rgba8();
-                copy_image_to_atlas_tile(&mut data, idx, &rgba, tile_size, atlas_size);
-                loaded_textures.insert(idx);
+                write_layer_rgba(&mut data, idx as u8, &resized.to_rgba8(), tile_size, mip_count);
+                loaded_textures.insert(idx as u8);
                 info!("Loaded custom block texture: {} ({}x{})", def.name, tile_size, tile_size);
             }
         }
     }
 
-    let (atlas_chain, mip_count) = generate_atlas_mip_chain(data, atlas_size);
+    (data, mip_count, loaded_textures)
+}
 
-    // Construct via new_uninit + manual data assignment: Image::new's
-    // `debug_assert_eq!(size.volume() * pixel_size, data.len())` would
-    // panic in debug builds because our chain is ~4/3× the mip0 byte
-    // length once mipmaps are appended.
+/// Assemble the D2 array Image from layer-major data.
+fn make_layer_array_image(data: Vec<u8>, tile_size: u32, mip_count: u32, aniso: u16) -> Image {
+    use bevy::image::ImageSampler;
+    use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureDataOrder};
+
+    // new_uninit + manual assignment: Image::new's debug_assert compares
+    // data length against mip 0 alone and would reject the mip chain.
     let mut image = Image::new_uninit(
         Extent3d {
-            width: atlas_size,
-            height: atlas_size,
-            depth_or_array_layers: 1,
+            width: tile_size,
+            height: tile_size,
+            depth_or_array_layers: BLOCK_LAYER_COUNT,
         },
         TextureDimension::D2,
         TextureFormat::Rgba8UnormSrgb,
         RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
     );
     image.texture_descriptor.mip_level_count = mip_count;
-    image.data = Some(atlas_chain);
-
-    // Nearest mag + Linear min/mipmap: crisp voxel pixels up close, smooth
-    // far-distance sampling that eliminates the sub-pixel texel-flip
-    // shimmer Nearest min-filter produces. Anisotropic filtering needs
-    // mipmaps to do anything, which is why we now generate them above.
-    let aniso = game_settings.anisotropic_filtering.max(1);
-    let sampler_desc = make_atlas_sampler_desc(aniso);
-    image.sampler = ImageSampler::Descriptor(sampler_desc);
-
-    let image_handle = images.add(image);
-
-    // Build an emissive atlas: black everywhere except the lantern tile (index 8),
-    // which gets a bright warm glow. This makes lanterns visibly bright without
-    // affecting other blocks or requiring a separate material.
-    let mut emissive_data = vec![0u8; (atlas_size * atlas_size * 4) as usize];
-    fill_atlas_tile(
-        &mut emissive_data,
-        BlockType::LANTERN.index(),
-        Color::linear_rgba(1.0, 0.85, 0.45, 1.0),
-        tile_size,
-        atlas_size,
-    );
-    let emissive_image = Image::new(
-        Extent3d {
-            width: atlas_size,
-            height: atlas_size,
-            depth_or_array_layers: 1,
-        },
-        TextureDimension::D2,
-        emissive_data,
-        TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
-    );
-    let emissive_handle = images.add(emissive_image);
-
-    // DEBUG: uncomment the block below to replace the atlas material with
-    // a solid magenta unlit material. If chunks appear magenta, geometry is
-    // correct and the bug is in textures/materials. If chunks are still
-    // invisible, the bug is in mesh generation or visibility.
-    // TODO: remove after diagnosis.
-    #[cfg(debug_assertions)]
-    let debug_override_material = false; // flip to true to activate
-
-    #[cfg(debug_assertions)]
-    let material = if debug_override_material {
-        materials.add(StandardMaterial {
-            base_color: Color::linear_rgb(1.0, 0.0, 1.0),
-            unlit: true,
-            ..default()
-        })
-    } else {
-        materials.add(StandardMaterial {
-            base_color_texture: Some(image_handle.clone()),
-            base_color: Color::WHITE,
-            emissive: bevy::color::LinearRgba::new(6.0, 5.1, 2.7, 1.0),
-            emissive_texture: Some(emissive_handle),
-            reflectance: 0.0,
-            ..default()
-        })
-    };
-    #[cfg(not(debug_assertions))]
-    let material = materials.add(StandardMaterial {
-        base_color_texture: Some(image_handle.clone()),
-        base_color: Color::WHITE,
-        emissive: bevy::color::LinearRgba::new(6.0, 5.1, 2.7, 1.0),
-        emissive_texture: Some(emissive_handle),
-        reflectance: 0.0,
-        ..default()
-    });
-
-    // Debug: validate all asset handles are valid and bound.
-    #[cfg(debug_assertions)]
-    {
-        let mat_valid = materials.get(&material).is_some();
-        let atlas_valid = images.get(&image_handle).is_some();
-        let atlas_size_px = images.get(&image_handle).map(|img| {
-            let e = &img.texture_descriptor.size;
-            (e.width, e.height)
-        });
-
-        bevy::log::info!(
-            "Asset validation: material={} atlas_image={} atlas_size={:?} \
-             tile_size={} loaded_textures={}/{}",
-            if mat_valid { "OK" } else { "MISSING" },
-            if atlas_valid { "OK" } else { "MISSING" },
-            atlas_size_px.unwrap_or((0, 0)),
-            tile_size,
-            loaded_textures.len(),
-            crate::block_types::BUILTIN_BLOCK_COUNT,
-        );
-
-        debug_assert!(mat_valid, "Chunk material handle is invalid after creation");
-        debug_assert!(atlas_valid, "Atlas image handle is invalid after creation");
-
-        // Verify the material's texture handles resolve.
-        if let Some(mat) = materials.get(&material) {
-            let base_ok = mat.base_color_texture.as_ref()
-                .map(|h| images.get(h).is_some()).unwrap_or(false);
-            let emissive_ok = mat.emissive_texture.as_ref()
-                .map(|h| images.get(h).is_some()).unwrap_or(true);
-            bevy::log::info!(
-                "Material textures: base_color={} emissive={}",
-                if base_ok { "OK" } else { "MISSING" },
-                if emissive_ok { "OK" } else { "MISSING" },
-            );
-            debug_assert!(base_ok, "base_color_texture handle does not resolve to an Image");
-        }
-    }
-
-    commands.insert_resource(ChunkMaterial { handle: material });
-    commands.insert_resource(BlockAtlas {
-        image_handle,
-        loaded_textures,
-        tile_size,
-        atlas_size,
-    });
+    // Our data is packed layer-major (each layer's mip chain contiguous);
+    // tell the uploader explicitly rather than relying on the default.
+    image.data_order = TextureDataOrder::LayerMajor;
+    image.data = Some(data);
+    image.sampler = ImageSampler::Descriptor(make_layer_sampler_desc(aniso));
+    image
 }
 
-/// Copy raw RGBA8 pixel data into a tile slot of the atlas.
-pub fn copy_image_to_atlas_tile(atlas_data: &mut [u8], block_idx: u8, rgba: &image::RgbaImage, tile_size: u32, atlas_width: u32) {
-    if block_idx >= crate::block_types::MAX_BLOCK_TYPES {
-        return;
-    }
-    let tiles_per_row = ATLAS_TILES_PER_ROW;
 
-    let tile_x = (block_idx as u32) % tiles_per_row;
-    let tile_y = (block_idx as u32) / tiles_per_row;
-    let base_px = tile_x * tile_size;
-    let base_py = tile_y * tile_size;
-
-    let border = 3u32;
-
-    for py in 0..tile_size {
-        for px in 0..tile_size {
-            let ix = base_px + px;
-            let iy = base_py + py;
-            let i = ((iy * atlas_width + ix) * 4) as usize;
-
-            let is_border = px < border || px >= tile_size - border
-                || py < border || py >= tile_size - border;
-
-            if is_border {
-                // Darken texture pixels at border
-                let src = rgba.get_pixel(px, py);
-                atlas_data[i] = ((src[0] as f32) * 0.65) as u8;
-                atlas_data[i + 1] = ((src[1] as f32) * 0.65) as u8;
-                atlas_data[i + 2] = ((src[2] as f32) * 0.65) as u8;
-                atlas_data[i + 3] = src[3];
-            } else {
-                let src_pixel = rgba.get_pixel(px, py);
-                atlas_data[i] = src_pixel[0];
-                atlas_data[i + 1] = src_pixel[1];
-                atlas_data[i + 2] = src_pixel[2];
-                atlas_data[i + 3] = src_pixel[3];
-            }
-        }
-    }
-}
-
-/// Generate a complete mip chain for the atlas image.
-///
-/// Each mip level is built **per tile**: every mip-N pixel inside a tile
-/// is the average of a `ratio × ratio` block of pixels from that same
-/// tile in mip 0 (where `ratio = base_tile_size / cur_tile_size`). This
-/// matters because the alternative — box-filtering each mip from the
-/// previous mip — averages across tile boundaries at every level and
-/// rapidly contaminates each tile's color with its neighbors. Per-tile
-/// downsampling keeps every tile's pyramid pure; the only neighbor
-/// bleed at runtime comes from the Linear sampler's 2×2 blend at the
-/// outermost texel, which the chunk.rs UV inset covers.
-///
-/// Chain stops when the atlas would drop below `min_atlas_size` (32 px)
-/// or `base_tile_size` is no longer divisible by the next ratio. At
-/// `min_atlas_size = 32`, each tile is 4×4 px — enough to keep distinct
-/// per-block color at the horizon while giving the GPU 4-5 mip levels
-/// of LOD headroom (vs the 1-2 levels the previous cap allowed).
-///
-/// Averaging is in linear color space (the atlas is `Rgba8UnormSrgb`)
-/// to avoid the gamma-darkening artifact of naive sRGB averaging.
-fn generate_atlas_mip_chain(base_data: Vec<u8>, base_size: u32) -> (Vec<u8>, u32) {
-    let min_atlas_size: u32 = 32;
-    let tiles_per_row = ATLAS_TILES_PER_ROW;
-    let base_tile_size = base_size / tiles_per_row;
-    if base_tile_size * tiles_per_row != base_size {
-        // Atlas dimensions don't tile cleanly — refuse to build mips
-        // rather than risk subtly misaligned sampling.
-        return (base_data, 1);
-    }
-
-    let mut chain = base_data;
-    let mut mip_count: u32 = 1;
-
-    // sRGB-to-linear LUT for byte values 0..=255.
-    let mut srgb_to_lin = [0.0f32; 256];
-    for (i, slot) in srgb_to_lin.iter_mut().enumerate() {
-        let c = i as f32 / 255.0;
-        *slot = if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
-    }
-
-    let mut ratio: u32 = 2;
-    loop {
-        if base_tile_size % ratio != 0 {
-            break;
-        }
-        let cur_tile_size = base_tile_size / ratio;
-        let cur_atlas_size = cur_tile_size * tiles_per_row;
-        if cur_atlas_size < min_atlas_size {
-            break;
-        }
-
-        let mip_byte_len = (cur_atlas_size * cur_atlas_size * 4) as usize;
-        let mut mip_data = vec![0u8; mip_byte_len];
-        let samples_per_pixel = (ratio * ratio) as f32;
-        let inv_samples = 1.0 / samples_per_pixel;
-
-        for tile_y in 0..tiles_per_row {
-            for tile_x in 0..tiles_per_row {
-                let src_tx = tile_x * base_tile_size;
-                let src_ty = tile_y * base_tile_size;
-                let dst_tx = tile_x * cur_tile_size;
-                let dst_ty = tile_y * cur_tile_size;
-
-                for py in 0..cur_tile_size {
-                    for px in 0..cur_tile_size {
-                        let dst_x = dst_tx + px;
-                        let dst_y = dst_ty + py;
-                        let dst_idx = ((dst_y * cur_atlas_size + dst_x) * 4) as usize;
-
-                        let mut sum_rgb = [0.0f32; 3];
-                        let mut sum_a: u32 = 0;
-                        for sy in 0..ratio {
-                            for sx in 0..ratio {
-                                let src_x = src_tx + px * ratio + sx;
-                                let src_y = src_ty + py * ratio + sy;
-                                let si = ((src_y * base_size + src_x) * 4) as usize;
-                                sum_rgb[0] += srgb_to_lin[chain[si] as usize];
-                                sum_rgb[1] += srgb_to_lin[chain[si + 1] as usize];
-                                sum_rgb[2] += srgb_to_lin[chain[si + 2] as usize];
-                                sum_a += chain[si + 3] as u32;
-                            }
-                        }
-                        for c in 0..3 {
-                            let lin = sum_rgb[c] * inv_samples;
-                            mip_data[dst_idx + c] = (linear_to_srgb(lin) * 255.0).round().clamp(0.0, 255.0) as u8;
-                        }
-                        mip_data[dst_idx + 3] = (sum_a as f32 * inv_samples).round().clamp(0.0, 255.0) as u8;
-                    }
-                }
-            }
-        }
-
-        chain.extend_from_slice(&mip_data);
-        mip_count += 1;
-
-        // Next mip down — only if it's still cleanly divisible.
-        let Some(next_ratio) = ratio.checked_mul(2) else { break };
-        ratio = next_ratio;
-    }
-
-    (chain, mip_count)
-}
-
-/// Build the sampler descriptor used for the block atlas. Mag = Nearest
-/// preserves the crisp pixel look at close range; Min + Mipmap = Linear
-/// kills distance shimmer (sub-pixel texel-flip aliasing) and lets
-/// anisotropic filtering do something useful — aniso requires mipmaps.
-fn make_atlas_sampler_desc(aniso: u16) -> bevy::image::ImageSamplerDescriptor {
-    use bevy::image::{ImageFilterMode, ImageSamplerDescriptor};
+/// Sampler for the block layer array. Mag = Nearest preserves the crisp
+/// pixel look up close; Min + Mipmap = Linear kills distance shimmer.
+/// Address mode = Repeat so greedy-merged quads tile their block texture
+/// (UVs run 0..w along merged runs). NOTE: enabling anisotropy forces all
+/// filters to Linear (wgpu validity requirement — bevy's helper does this),
+/// trading crisp closeups for smooth grazing angles.
+fn make_layer_sampler_desc(aniso: u16) -> bevy::image::ImageSamplerDescriptor {
+    use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSamplerDescriptor};
     let mut desc = ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::Repeat,
         mag_filter: ImageFilterMode::Nearest,
         min_filter: ImageFilterMode::Linear,
         mipmap_filter: ImageFilterMode::Linear,
@@ -732,8 +671,18 @@ fn load_chunks(
     cameras: Query<&GlobalTransform, With<Camera3d>>,
     game_settings: Option<Res<crate::settings::GameSettings>>,
     world_id: Res<crate::WorldInstanceId>,
+    pending_reload: Res<crate::PendingReload>,
     mut last_scan: Local<Option<(ChunkPos, i32, u64)>>,
 ) {
+    // No new generation tasks while a Play/Load reload is counting down:
+    // the WorldInstanceId is already bumped, so a task spawned here would
+    // carry the NEW id, survive teardown, and duplicate a chunk the fresh
+    // session generates for itself (its `pending` entry is wiped by
+    // clear_all, so nothing would dedupe it).
+    if pending_reload.active {
+        return;
+    }
+
     // Use the camera position as the player position
     let camera_pos = match cameras.iter().next() {
         Some(gt) => gt.translation(),
@@ -893,7 +842,7 @@ fn handle_chunk_tasks(
     chunk_material: Option<Res<ChunkMaterial>>,
     mut opt_flags: ResMut<crate::dev_tools::OptimizationFlags>,
     dev: Res<crate::dev_tools::DevSettings>,
-    world_id: Res<crate::WorldInstanceId>,
+    world_ready: Option<Res<crate::player::WorldReady>>,
 ) {
     // Debug: auto-disable greedy meshing if an invariant was violated.
     #[cfg(debug_assertions)]
@@ -930,7 +879,14 @@ fn handle_chunk_tasks(
     // (initial load, fast movement) meshes dozens of chunks in one frame and
     // produces a visible hitch. Remaining ready tasks are picked up on
     // subsequent frames.
-    let mesh_budget = dev.max_chunk_meshes_per_frame.max(1) as usize;
+    //
+    // While the world ISN'T ready yet (loading overlay up, player camera
+    // inactive) there is nothing on screen a hitch could disturb — mesh 8×
+    // as aggressively so large render distances fill in seconds instead of
+    // visibly assembling in front of the player after the gate opens.
+    let ready = world_ready.map(|r| r.0).unwrap_or(true);
+    let base_budget = dev.max_chunk_meshes_per_frame.max(1) as usize;
+    let mesh_budget = if ready { base_budget } else { base_budget * 8 };
     let mut meshed_this_frame = 0usize;
 
     for (entity, mut compute) in &mut tasks {
@@ -1021,9 +977,13 @@ fn handle_chunk_tasks(
             // NoFrustumCulling; it disables culling entirely and is a
             // performance regression. Bevy computes Aabb from the mesh
             // automatically and caches it per entity.
+            // Do NOT re-insert WorldEntity/WorldScoped here — the entity
+            // carries them from its spawn in load_chunks. Re-stamping with
+            // the CURRENT WorldInstanceId would let a task that completes
+            // during the PendingReload deferral (after the id bump, before
+            // teardown) adopt the NEW world's id and survive teardown as a
+            // ghost mesh carrying the abandoned session's data.
             ec.remove::<ComputeChunk>().insert((
-                crate::WorldEntity,
-                crate::WorldScoped(world_id.0),
                 ChunkMarker { pos },
                 Mesh3d(mesh_handle),
                 MeshMaterial3d(material_handle),
@@ -1070,7 +1030,7 @@ fn remesh_dirty_chunks(
     mut commands: Commands,
     mut manager: ResMut<ChunkManager>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mesh_query: Query<(Entity, &Mesh3d, Option<&MeshMaterial3d<StandardMaterial>>), With<ChunkMarker>>,
+    mesh_query: Query<(Entity, &Mesh3d, Option<&MeshMaterial3d<BlockArrayMaterial>>), With<ChunkMarker>>,
     chunk_material: Option<Res<ChunkMaterial>>,
     opt_flags: Res<crate::dev_tools::OptimizationFlags>,
     dev: Res<crate::dev_tools::DevSettings>,
@@ -1248,8 +1208,12 @@ fn unload_chunks(
     }
 }
 
-/// System: detect texture_size changes and rebuild the atlas image in-place.
-fn apply_texture_size_change(
+/// React to texture settings changes: rebuilds all layers when
+/// texture_size changes, or just swaps the sampler when only the
+/// anisotropic filtering level changed. Replaces the two previous systems
+/// (apply_texture_size_change / apply_aniso_filter_change), whose size
+/// path was a full copy of the setup builder.
+fn apply_texture_settings_change(
     game_settings: Option<Res<crate::settings::GameSettings>>,
     mut block_atlas: Option<ResMut<BlockAtlas>>,
     mut images: ResMut<Assets<Image>>,
@@ -1259,139 +1223,27 @@ fn apply_texture_size_change(
         return;
     }
     let Some(ref mut atlas) = block_atlas else { return };
-    let new_tile_size = settings.texture_size.clamp(64, 512);
-    if new_tile_size == atlas.tile_size {
-        return;
-    }
 
-    let new_atlas_size = ATLAS_TILES_PER_ROW * new_tile_size;
-    let mut data = vec![255u8; (new_atlas_size * new_atlas_size * 4) as usize];
+    let new_tile = normalize_tile_size(settings.texture_size);
+    let new_aniso = settings.anisotropic_filtering.max(1);
 
-    let all_blocks = [
-        BlockType::AIR,
-        BlockType::GRASS,
-        BlockType::DIRT,
-        BlockType::STONE,
-        BlockType::SAND,
-        BlockType::WOOD,
-        BlockType::DIAMOND,
-        BlockType::BEDROCK,
-        BlockType::LANTERN,
-        BlockType::BED,
-        BlockType::PILLOW,
-        BlockType::LEAVES,
-        BlockType::STONE_BRICK,
-    ];
-
-    // Fill solid color tiles
-    for &block in &all_blocks {
-        fill_atlas_tile(&mut data, block.index(), block.color(), new_tile_size, new_atlas_size);
-    }
-    for idx in crate::block_types::CUSTOM_BLOCK_START..crate::block_types::MAX_BLOCK_TYPES {
-        fill_atlas_tile(&mut data, idx, Color::WHITE, new_tile_size, new_atlas_size);
-    }
-
-    // Re-load block textures (settings path = user-selected via dialog,
-    // textures/ directory = developer convenience only)
-    let mut new_loaded = HashSet::new();
-    for &block in &all_blocks {
-        if block == BlockType::AIR {
-            continue;
+    if new_tile != atlas.tile_size {
+        // Full rebuild through the same builder setup uses.
+        let (data, mip_count, loaded) = build_layers_data(&settings, new_tile);
+        if let Some(image) = images.get_mut(&atlas.image_handle) {
+            *image = make_layer_array_image(data, new_tile, mip_count, new_aniso);
         }
-        let name = block.name();
-        let name_lower = name.to_lowercase();
-        let settings_path = settings.block_textures.get(name);
-        let try_paths: Vec<String> = if let Some(sp) = settings_path {
-            vec![sp.clone(), format!("textures/{}.png", name_lower)]
-        } else {
-            vec![format!("textures/{}.png", name_lower)]
-        };
-        for tex_path in &try_paths {
-            if let Ok(img_data) = std::fs::read(tex_path) {
-                if let Ok(dyn_img) = image::load_from_memory(&img_data) {
-                    let resized = dyn_img.resize_exact(
-                        new_tile_size,
-                        new_tile_size,
-                        image::imageops::FilterType::Lanczos3,
-                    );
-                    let rgba = resized.to_rgba8();
-                    copy_image_to_atlas_tile(&mut data, block.index(), &rgba, new_tile_size, new_atlas_size);
-                    new_loaded.insert(block.index());
-                    break;
-                }
-            }
+        atlas.tile_size = new_tile;
+        atlas.mip_count = mip_count;
+        atlas.loaded_textures = loaded;
+        atlas.aniso = new_aniso;
+        info!("Block layers rebuilt: {}px tiles, {} mips", new_tile, mip_count);
+    } else if new_aniso != atlas.aniso {
+        // Sampler-only change: no data rebuild.
+        if let Some(image) = images.get_mut(&atlas.image_handle) {
+            use bevy::image::ImageSampler;
+            image.sampler = ImageSampler::Descriptor(make_layer_sampler_desc(new_aniso));
         }
-    }
-
-    // Re-load custom block textures (same logic as setup_chunk_material).
-    // Without this, custom blocks would lose their textures when the user
-    // changes texture resolution — the atlas rebuild only handled built-ins.
-    for def in &settings.custom_blocks {
-        let idx = crate::block_types::CUSTOM_BLOCK_START
-            + settings.custom_blocks.iter().position(|d| d.name == def.name).unwrap_or(0) as u8;
-        if idx >= crate::block_types::MAX_BLOCK_TYPES {
-            continue;
-        }
-        if let Ok(img_data) = std::fs::read(&def.texture_path) {
-            if let Ok(dyn_img) = image::load_from_memory(&img_data) {
-                let resized = dyn_img.resize_exact(
-                    new_tile_size,
-                    new_tile_size,
-                    image::imageops::FilterType::Lanczos3,
-                );
-                let rgba = resized.to_rgba8();
-                copy_image_to_atlas_tile(&mut data, idx, &rgba, new_tile_size, new_atlas_size);
-                new_loaded.insert(idx);
-            }
-        }
-    }
-
-    // Replace the image data in-place (with regenerated mip chain).
-    if let Some(image) = images.get_mut(&atlas.image_handle) {
-        use bevy::image::ImageSampler;
-        use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-        let (atlas_chain, mip_count) = generate_atlas_mip_chain(data, new_atlas_size);
-        // See note in setup_chunk_material: Image::new would panic on
-        // the chain length vs mip0 extent in debug builds.
-        let mut new_image = Image::new_uninit(
-            Extent3d {
-                width: new_atlas_size,
-                height: new_atlas_size,
-                depth_or_array_layers: 1,
-            },
-            TextureDimension::D2,
-            TextureFormat::Rgba8UnormSrgb,
-            bevy::asset::RenderAssetUsages::MAIN_WORLD | bevy::asset::RenderAssetUsages::RENDER_WORLD,
-        );
-        new_image.texture_descriptor.mip_level_count = mip_count;
-        new_image.data = Some(atlas_chain);
-        let aniso = settings.anisotropic_filtering.max(1);
-        new_image.sampler = ImageSampler::Descriptor(make_atlas_sampler_desc(aniso));
-        *image = new_image;
-    }
-
-    atlas.tile_size = new_tile_size;
-    atlas.atlas_size = new_atlas_size;
-    atlas.loaded_textures = new_loaded;
-    info!("Atlas rebuilt: {}px tiles ({}x{} atlas)", new_tile_size, new_atlas_size, new_atlas_size);
-}
-
-/// System: apply anisotropic filtering changes to the atlas sampler at runtime.
-fn apply_aniso_filter_change(
-    game_settings: Option<Res<crate::settings::GameSettings>>,
-    block_atlas: Option<Res<BlockAtlas>>,
-    mut images: ResMut<Assets<Image>>,
-) {
-    let Some(settings) = game_settings else { return };
-    if !settings.is_changed() {
-        return;
-    }
-    let Some(atlas) = block_atlas else { return };
-
-    // Only update sampler, not rebuild the whole atlas
-    if let Some(image) = images.get_mut(&atlas.image_handle) {
-        use bevy::image::ImageSampler;
-        let aniso = settings.anisotropic_filtering.max(1);
-        image.sampler = ImageSampler::Descriptor(make_atlas_sampler_desc(aniso));
+        atlas.aniso = new_aniso;
     }
 }

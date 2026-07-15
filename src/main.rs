@@ -453,9 +453,11 @@ fn guard_clean_world_on_entry(
 /// teardown function because it must not touch the world. If you are looking
 /// for "overlay teardown" — there is none, by design.
 ///
-/// Runs AFTER capture_exit_screenshot (which fires on OnExit(Gameplay)),
-/// giving the renderer one frame to capture the screenshot with the
-/// world camera still alive.
+/// NOTE: currently dead code in practice — nothing transitions back to
+/// GameState::Menu after startup (Play/Load are same-state Gameplay
+/// cycles). Kept as the safety net for any future title-menu return path.
+/// The menu-background screenshot is captured at Play/Load click time via
+/// request_menu_screenshot, NOT here.
 fn cleanup_world(
     mut commands: Commands,
     scoped_entities: Query<(Entity, &WorldScoped), Without<BackgroundPlate>>,
@@ -544,10 +546,11 @@ fn reset_chunk_state_on_teardown(
 ///   1. request_menu_screenshot MUST write the screenshot PNG to disk
 ///      (via Bevy's async save_to_disk observer).
 ///   2. request_menu_screenshot MUST persist the PNG path into save
-///      metadata (via update_save_screenshot_path) BEFORE the screenshot
-///      is captured, so the path exists even if the async write is delayed.
+///      metadata (via save_load::persist_screenshot_path) BEFORE the
+///      screenshot is captured, so the path exists even if the async write
+///      is delayed.
 ///   3. Menu background loading depends ONLY on save metadata — it reads
-///      last_menu_background_image_path from the JSON, never guesses paths.
+///      last_menu_background_image_path from the save, never guesses paths.
 ///   4. The screenshot file is optional (may not exist yet on first launch).
 ///      The Menu falls back to a solid dark panel if the file is missing.
 ///   5. TIMING: the capture is requested at reload-initiation time (Play /
@@ -592,74 +595,17 @@ fn auto_save_on_exit(
 /// keeps the world alive for the frames the renderer needs to capture it.
 pub fn request_menu_screenshot(commands: &mut Commands) {
     use bevy::render::view::screenshot::{save_to_disk, Screenshot};
-    let save_json_path = dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".metalworld_save.json");
-    let screenshot_path = save_json_path.with_extension("png");
+    let screenshot_path = save_load::save_path().with_extension("png");
 
     #[cfg(debug_assertions)]
     bevy::log::info!("Capturing menu screenshot → {}", screenshot_path.display());
 
-    // Update the save metadata with the screenshot path so the Menu can find it.
-    // Read-modify-write: preserve all existing fields, inject/overwrite the path.
-    update_save_screenshot_path(&save_json_path, &screenshot_path);
+    // Persist the path into save metadata BEFORE the async capture, so the
+    // Menu can find it even if the PNG write is still in flight.
+    save_load::persist_screenshot_path(&screenshot_path);
 
     commands.spawn(Screenshot::primary_window())
         .observe(save_to_disk(screenshot_path));
-}
-
-/// Inject `last_menu_background_image_path` into the save JSON file.
-/// If the file exists, read-modify-write to preserve all fields.
-/// If the file doesn't exist, create a minimal JSON with just the path.
-/// This ensures the Menu can always find the screenshot regardless of
-/// whether the player saved manually.
-fn update_save_screenshot_path(save_path: &std::path::Path, screenshot_path: &std::path::Path) {
-    let screenshot_str = screenshot_path.to_string_lossy().into_owned();
-
-    let json = if let Ok(data) = std::fs::read_to_string(save_path) {
-        if let Ok(mut existing) = serde_json::from_str::<serde_json::Value>(&data) {
-            if let Some(obj) = existing.as_object_mut() {
-                obj.insert(
-                    "last_menu_background_image_path".to_string(),
-                    serde_json::Value::String(screenshot_str.clone()),
-                );
-            }
-            existing
-        } else {
-            // File exists but is invalid JSON — overwrite with minimal save.
-            serde_json::json!({
-                "last_menu_background_image_path": screenshot_str
-            })
-        }
-    } else {
-        // No save file yet — create a minimal one with just the screenshot path.
-        serde_json::json!({
-            "last_menu_background_image_path": screenshot_str
-        })
-    };
-
-    match serde_json::to_string_pretty(&json) {
-        Ok(updated) => {
-            match std::fs::write(save_path, &updated) {
-                Ok(()) => {
-                    #[cfg(debug_assertions)]
-                    bevy::log::info!(
-                        "Screenshot path persisted to {} ({}B written)",
-                        save_path.display(), updated.len(),
-                    );
-                }
-                Err(e) => {
-                    bevy::log::warn!(
-                        "Failed to write save metadata to {}: {}",
-                        save_path.display(), e,
-                    );
-                }
-            }
-        }
-        Err(e) => {
-            bevy::log::warn!("Failed to serialize save metadata: {}", e);
-        }
-    }
 }
 
 /// Single authoritative source for the player-facing game name.
@@ -667,7 +613,6 @@ fn update_save_screenshot_path(save_path: &std::path::Path, screenshot_path: &st
 pub const GAME_NAME: &str = "Sandbox World";
 
 use animals::AnimalPlugin;
-use buildings::BuildingsPlugin;
 use chunk_manager::ChunkManagerPlugin;
 use dev_tools::DevToolsPlugin;
 use lighting::LightingPlugin;
@@ -773,8 +718,8 @@ fn main() {
         //   system that reads render_distance, texture_size, etc.
         // - ChunkManagerPlugin before PlayerPlugin: ChunkManager resource must
         //   exist at Startup so player collision can fall back to terrain gen.
-        // - PlayerPlugin before BuildingsPlugin: player entity must be spawned
-        //   before buildings place blocks (buildings reference player position).
+        // - Buildings have no plugin: they are baked into chunk generation
+        //   (buildings::place_buildings_in_chunk, called by Chunk::generate).
         // - AnimalPlugin after ChunkManager: animals query ChunkManager for
         //   ground height; resource must exist.
         // - LightingPlugin after PlayerPlugin: lighting Update systems read
@@ -789,7 +734,6 @@ fn main() {
             SettingsPlugin,
             ChunkManagerPlugin,
             PlayerPlugin,
-            BuildingsPlugin,
             AnimalPlugin,
             LightingPlugin,
             SkyPlugin,

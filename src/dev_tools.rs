@@ -85,8 +85,6 @@ impl Default for DevSettings {
 }
 
 /// Centralized safety switches for optimization features.
-/// ALL default to OFF so the engine matches the correctness baseline exactly.
-/// Each flag must be explicitly enabled after the optimization is validated.
 ///
 /// HARD RULE: Correctness gates all performance work. Missing blocks or
 /// textures invalidate every optimization — no exception. Performance
@@ -112,15 +110,17 @@ impl Default for DevSettings {
 ///     disappears after enabling greedy meshing, disable it immediately.
 #[derive(Resource)]
 pub struct OptimizationFlags {
-    /// Merge adjacent coplanar same-type faces into larger quads.
-    /// OFF = one quad per visible face.
+    /// Merge adjacent coplanar same-type/same-AO faces into larger quads.
+    /// ON by default since the texture-array material (UV repeat across
+    /// merged runs) removed the atlas-UV blocker; the debug kill-switch
+    /// still auto-disables it if a meshing invariant trips.
     pub enable_greedy_meshing: bool,
 }
 
 impl Default for OptimizationFlags {
     fn default() -> Self {
         Self {
-            enable_greedy_meshing: false,
+            enable_greedy_meshing: true,
         }
     }
 }
@@ -198,6 +198,14 @@ impl Plugin for DevToolsPlugin {
             // all Update systems) to measure the elapsed CPU work time,
             // excluding vsync wait which happens between Last and First.
             .add_systems(First, mark_frame_start)
+            // Headless verification harness (env-gated, no-op otherwise):
+            //   METALWORLD_AUTOSTART=1  — click "Play" programmatically on
+            //                             the first frame (New Game).
+            //   METALWORLD_SHOT=<path>  — once the world is ready, wait ~1s,
+            //                             save a screenshot there, then exit.
+            // Lets scripted runs drive the real meshing/render pipeline and
+            // produce an inspectable image without a human clicking.
+            .add_systems(Update, (dev_autostart, dev_auto_screenshot))
             .add_systems(Startup, spawn_fps_display)
             .add_systems(Last, update_fps_display)
             .add_systems(Last, frame_limiter_system.after(update_fps_display))
@@ -1085,3 +1093,84 @@ fn dev_hotkey_world_reset(
     );
 }
 
+
+// ---------------------------------------------------------------------------
+// Headless verification harness (env-gated)
+// ---------------------------------------------------------------------------
+
+/// Mimics the Play button when METALWORLD_AUTOSTART is set: schedules a
+/// NewGame teardown/reload exactly like ui.rs handle_play_and_load_buttons
+/// (same resources, same PendingReload deferral), once, on the first frame.
+#[allow(clippy::too_many_arguments)]
+fn dev_autostart(
+    mut fired: Local<bool>,
+    mut commands: Commands,
+    menu_query: Query<Entity, With<crate::ui::SettingsMenu>>,
+    mut menu_state: ResMut<crate::ui::MenuState>,
+    mut start_mode: ResMut<crate::save_load::StartMode>,
+    mut teardown_intent: ResMut<crate::TeardownIntent>,
+    mut world_instance: ResMut<crate::WorldInstanceId>,
+    mut pending_teardown: ResMut<crate::PendingTeardown>,
+    mut pending_reload: ResMut<crate::PendingReload>,
+) {
+    if *fired || std::env::var_os("METALWORLD_AUTOSTART").is_none() {
+        return;
+    }
+    *fired = true;
+
+    bevy::log::warn!("METALWORLD_AUTOSTART: entering Gameplay (NewGame) without user input");
+    *start_mode = crate::save_load::StartMode::NewGame;
+    let old_id = world_instance.0;
+    world_instance.0 = old_id + 1;
+    *pending_teardown = crate::PendingTeardown {
+        old_id,
+        kind: crate::TeardownIntent::NewGame,
+    };
+    *teardown_intent = crate::TeardownIntent::NewGame;
+    menu_state.is_open = false;
+    for entity in &menu_query {
+        commands.entity(entity).despawn();
+    }
+    *pending_reload = crate::PendingReload {
+        active: true,
+        frames: crate::RELOAD_DEFER_FRAMES,
+    };
+}
+
+/// When METALWORLD_SHOT=<path> is set: after WorldReady flips true, waits
+/// ~60 frames for lighting/streaming to settle, captures a screenshot to
+/// <path>, then exits 90 frames later (giving the async PNG write time).
+fn dev_auto_screenshot(
+    mut frames_ready: Local<u32>,
+    mut requested: Local<bool>,
+    world_ready: Option<Res<crate::player::WorldReady>>,
+    chunk_manager: Option<Res<ChunkManager>>,
+    mut commands: Commands,
+) {
+    let Some(path) = std::env::var_os("METALWORLD_SHOT") else {
+        return;
+    };
+    if !world_ready.map(|r| r.0).unwrap_or(false) {
+        return;
+    }
+    // Wait for chunk streaming/remesh quiescence so the capture shows the
+    // fully assembled world, not a mid-stream snapshot.
+    if !*requested && !chunk_manager.map(|cm| cm.streaming_idle()).unwrap_or(true) {
+        *frames_ready = 0;
+        return;
+    }
+    *frames_ready += 1;
+    if *frames_ready >= 60 && !*requested {
+        *requested = true;
+        use bevy::render::view::screenshot::{save_to_disk, Screenshot};
+        let path = std::path::PathBuf::from(path);
+        bevy::log::warn!("METALWORLD_SHOT: capturing {}", path.display());
+        commands
+            .spawn(Screenshot::primary_window())
+            .observe(save_to_disk(path));
+    }
+    if *frames_ready >= 150 {
+        bevy::log::warn!("METALWORLD_SHOT: exiting after capture");
+        std::process::exit(0);
+    }
+}

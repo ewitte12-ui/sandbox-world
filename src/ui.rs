@@ -63,31 +63,13 @@ struct MenuCamera;
 /// Try to load the screenshot from the most recent save file for use as
 /// the title menu background. Returns None if no save or screenshot exists.
 fn load_menu_background_image(images: &mut Assets<Image>) -> Option<Handle<Image>> {
-    // Read the default save file to get the screenshot path.
-    let save_path = dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".metalworld_save.json");
-    let data = match std::fs::read_to_string(&save_path) {
-        Ok(d) => d,
-        Err(_) => {
-            #[cfg(debug_assertions)]
-            bevy::log::info!("Menu background: no save file at {}", save_path.display());
-            return None;
-        }
-    };
-
-    // Parse just enough to extract the image path.
-    #[derive(serde::Deserialize)]
-    struct Partial {
-        #[serde(default)]
-        last_menu_background_image_path: Option<String>,
-    }
-    let partial: Partial = serde_json::from_str(&data).ok()?;
-    let img_path = match partial.last_menu_background_image_path {
+    // The screenshot path lives in the default save (any format — the
+    // save_load reader sniffs by content).
+    let img_path = match crate::save_load::read_default_save().and_then(|s| s.background_path) {
         Some(p) if !p.is_empty() => p,
         _ => {
             #[cfg(debug_assertions)]
-            bevy::log::info!("Menu background: save has no screenshot path");
+            bevy::log::info!("Menu background: no save or no screenshot path");
             return None;
         }
     };
@@ -1291,8 +1273,8 @@ fn spawn_settings_tab_content(
     tab: SettingsTab,
     settings: &GameSettings,
     is_fullscreen: bool,
-    atlas_handle: Option<&Handle<Image>>,
-    atlas_tile_size: u32,
+    _atlas_handle: Option<&Handle<Image>>,
+    _atlas_tile_size: u32,
     previews: Option<&TexturePreviews>,
     tex_error: Option<&TextureLoadError>,
     custom_registry: Option<&crate::block_types::CustomBlockRegistry>,
@@ -1300,7 +1282,7 @@ fn spawn_settings_tab_content(
     match tab {
         SettingsTab::Display => spawn_display_tab(parent, settings, is_fullscreen),
         SettingsTab::Graphics => spawn_graphics_tab(parent, settings),
-        SettingsTab::BlockTextures => spawn_textures_tab(parent, settings, atlas_handle, atlas_tile_size, previews, tex_error, custom_registry),
+        SettingsTab::BlockTextures => spawn_textures_tab(parent, settings, _atlas_handle, _atlas_tile_size, previews, tex_error, custom_registry),
     }
 }
 
@@ -1648,8 +1630,8 @@ fn spawn_graphics_tab(parent: &mut ChildSpawnerCommands, settings: &GameSettings
 fn spawn_textures_tab(
     parent: &mut ChildSpawnerCommands,
     settings: &GameSettings,
-    atlas_handle: Option<&Handle<Image>>,
-    atlas_tile_size: u32,
+    _atlas_handle: Option<&Handle<Image>>,
+    _atlas_tile_size: u32,
     previews: Option<&TexturePreviews>,
     error: Option<&TextureLoadError>,
     custom_registry: Option<&crate::block_types::CustomBlockRegistry>,
@@ -1684,8 +1666,6 @@ fn spawn_textures_tab(
         ("Leaves", BlockType::LEAVES),
         ("StoneBrick", BlockType::STONE_BRICK),
     ];
-
-    let tiles_per_row = crate::chunk_manager::ATLAS_TILES_PER_ROW;
 
     // Wrapping grid container — cards flow left-to-right, wrap to next row.
     // The parent tab content has overflow: scroll_y() so the grid scrolls
@@ -1738,30 +1718,9 @@ fn spawn_textures_tab(
                             ..default()
                         },
                     ));
-                } else if let Some(handle) = atlas_handle {
-                    let tile_x = (block_idx as u32) % tiles_per_row;
-                    let tile_y = (block_idx as u32) / tiles_per_row;
-                    let ts = atlas_tile_size as f32;
-                    let rect = Rect::new(
-                        tile_x as f32 * ts,
-                        tile_y as f32 * ts,
-                        (tile_x + 1) as f32 * ts,
-                        (tile_y + 1) as f32 * ts,
-                    );
-                    card.spawn((
-                        ImageNode {
-                            image: handle.clone(),
-                            rect: Some(rect),
-                            ..default()
-                        },
-                        Node {
-                            width: Val::Px(64.0),
-                            height: Val::Px(64.0),
-                            margin: UiRect::bottom(Val::Px(4.0)),
-                            ..default()
-                        },
-                    ));
                 } else {
+                    // Solid color swatch. (Block textures live in 2D-array
+                    // layers now — ImageNode can't rect-crop a layer.)
                     card.spawn((
                         Node {
                             width: Val::Px(64.0),
@@ -1855,7 +1814,6 @@ fn spawn_textures_tab(
             margin: UiRect::bottom(Val::Px(10.0)),
             ..default()
         }).with_children(|grid| {
-            let tiles_per_row = crate::chunk_manager::ATLAS_TILES_PER_ROW;
             for entry in reg.iter() {
                 let idx = entry.atlas_index;
                 grid.spawn((
@@ -1875,27 +1833,18 @@ fn spawn_textures_tab(
                         Node { margin: UiRect::bottom(Val::Px(4.0)), ..default() },
                     ));
 
-                    // Preview from atlas
-                    if let Some(handle) = atlas_handle {
-                        let tile_x = (idx as u32) % tiles_per_row;
-                        let tile_y = (idx as u32) / tiles_per_row;
-                        let ts = atlas_tile_size as f32;
-                        let rect = Rect::new(
-                            tile_x as f32 * ts,
-                            tile_y as f32 * ts,
-                            (tile_x + 1) as f32 * ts,
-                            (tile_y + 1) as f32 * ts,
-                        );
-                        card.spawn((
-                            ImageNode { image: handle.clone(), rect: Some(rect), ..default() },
-                            Node {
-                                width: Val::Px(64.0),
-                                height: Val::Px(64.0),
-                                margin: UiRect::bottom(Val::Px(4.0)),
-                                ..default()
-                            },
-                        ));
-                    }
+                    // Color swatch (array layers can't be rect-cropped by
+                    // ImageNode; the entry's fallback color is the tile's
+                    // average).
+                    card.spawn((
+                        BackgroundColor(entry.color),
+                        Node {
+                            width: Val::Px(64.0),
+                            height: Val::Px(64.0),
+                            margin: UiRect::bottom(Val::Px(4.0)),
+                            ..default()
+                        },
+                    ));
 
                     // Remove button
                     card.spawn((
@@ -2718,12 +2667,12 @@ fn poll_texture_dialog(
     if let Some(ref mut atlas) = block_atlas {
         if let Some(img) = images.get_mut(&atlas.image_handle) {
             if let Some(data) = img.data.as_mut() {
-                crate::chunk_manager::copy_image_to_atlas_tile(
+                crate::chunk_manager::write_layer_rgba(
                     data,
                     block_idx,
                     &rgba,
                     atlas.tile_size,
-                    atlas.atlas_size,
+                    atlas.mip_count,
                 );
                 atlas.loaded_textures.insert(block_idx);
             }
@@ -2797,12 +2746,12 @@ fn handle_remove_texture_buttons(
         if let Some(ref mut atlas) = block_atlas {
             if let Some(img) = images.get_mut(&atlas.image_handle) {
                 if let Some(data) = img.data.as_mut() {
-                    crate::chunk_manager::fill_atlas_tile(
+                    crate::chunk_manager::write_layer_solid(
                         data,
                         btn.block_idx,
                         block_type.color(),
                         atlas.tile_size,
-                        atlas.atlas_size,
+                        atlas.mip_count,
                     );
                     atlas.loaded_textures.remove(&btn.block_idx);
                 }
@@ -2964,12 +2913,12 @@ fn poll_add_block_dialog(
         tex_error.message = Some("Atlas image data not available".to_string());
         return;
     };
-    crate::chunk_manager::copy_image_to_atlas_tile(
+    crate::chunk_manager::write_layer_rgba(
         data,
         atlas_index,
         &rgba,
         atlas.tile_size,
-        atlas.atlas_size,
+        atlas.mip_count,
     );
     atlas.loaded_textures.insert(atlas_index);
 
@@ -3025,12 +2974,12 @@ fn handle_remove_custom_block(
         if let Some(ref mut atlas) = block_atlas {
             if let Some(img) = images.get_mut(&atlas.image_handle) {
                 if let Some(data) = img.data.as_mut() {
-                    crate::chunk_manager::fill_atlas_tile(
+                    crate::chunk_manager::write_layer_solid(
                         data,
                         btn.atlas_index,
                         Color::WHITE,
                         atlas.tile_size,
-                        atlas.atlas_size,
+                        atlas.mip_count,
                     );
                     atlas.loaded_textures.remove(&btn.atlas_index);
                 }
@@ -3176,14 +3125,9 @@ fn spawn_inventory(
                     BlockType::STONE_BRICK,
                 ];
 
-                let tile_size = atlas.map(|a| a.tile_size as f32).unwrap_or(64.0);
 
                 for block in blocks {
                     let name = block.name();
-                    let block_idx = block.index() as u32;
-                    let tiles_per_row = crate::block_types::ATLAS_TILES_PER_ROW;
-                    let tile_x = block_idx % tiles_per_row;
-                    let tile_y = block_idx / tiles_per_row;
 
                     grid.spawn((
                         InventoryItem(block),
@@ -3199,39 +3143,17 @@ fn spawn_inventory(
                         BackgroundColor(Color::linear_rgba(0.2, 0.2, 0.25, 1.0)),
                     ))
                     .with_children(|item| {
-                        // Show atlas tile (texture or solid color from the atlas)
-                        if let Some(atlas_res) = atlas {
-                            let rect = Rect::new(
-                                tile_x as f32 * tile_size,
-                                tile_y as f32 * tile_size,
-                                (tile_x + 1) as f32 * tile_size,
-                                (tile_y + 1) as f32 * tile_size,
-                            );
-                            item.spawn((
-                                ImageNode {
-                                    image: atlas_res.image_handle.clone(),
-                                    rect: Some(rect),
-                                    ..default()
-                                },
-                                Node {
-                                    width: Val::Px(48.0),
-                                    height: Val::Px(48.0),
-                                    margin: UiRect::bottom(Val::Px(4.0)),
-                                    ..default()
-                                },
-                            ));
-                        } else {
-                            // Fallback: solid color swatch
-                            item.spawn((
-                                Node {
-                                    width: Val::Px(48.0),
-                                    height: Val::Px(48.0),
-                                    margin: UiRect::bottom(Val::Px(4.0)),
-                                    ..default()
-                                },
-                                BackgroundColor(block.color()),
-                            ));
-                        }
+                        // Color swatch (array layers can't be rect-cropped
+                        // by ImageNode).
+                        item.spawn((
+                            BackgroundColor(block.color()),
+                            Node {
+                                width: Val::Px(48.0),
+                                height: Val::Px(48.0),
+                                margin: UiRect::bottom(Val::Px(4.0)),
+                                ..default()
+                            },
+                        ));
                         // Name
                         item.spawn((
                             Text::new(name),
@@ -3248,9 +3170,6 @@ fn spawn_inventory(
                 if let Some(reg) = custom_registry {
                     for entry in reg.iter() {
                         let block = BlockType::from_u8(entry.atlas_index);
-                        let tiles_per_row = crate::block_types::ATLAS_TILES_PER_ROW;
-                        let tile_x = (entry.atlas_index as u32) % tiles_per_row;
-                        let tile_y = (entry.atlas_index as u32) / tiles_per_row;
 
                         grid.spawn((
                             InventoryItem(block),
@@ -3266,19 +3185,9 @@ fn spawn_inventory(
                             BackgroundColor(Color::linear_rgba(0.2, 0.25, 0.2, 1.0)),
                         ))
                         .with_children(|item| {
-                            if let Some(atlas_res) = atlas {
-                                let rect = Rect::new(
-                                    tile_x as f32 * tile_size,
-                                    tile_y as f32 * tile_size,
-                                    (tile_x + 1) as f32 * tile_size,
-                                    (tile_y + 1) as f32 * tile_size,
-                                );
+                            {
                                 item.spawn((
-                                    ImageNode {
-                                        image: atlas_res.image_handle.clone(),
-                                        rect: Some(rect),
-                                        ..default()
-                                    },
+                                    BackgroundColor(entry.color),
                                     Node {
                                         width: Val::Px(64.0),
                                         height: Val::Px(64.0),

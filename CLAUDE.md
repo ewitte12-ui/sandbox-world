@@ -18,8 +18,8 @@ MetalWorld is a Minecraft-style voxel game being ported from Swift/Metal to Bevy
 ## Architecture
 
 - **Engine:** Bevy 0.18 with wgpu backend
-- **Voxel storage:** 16x16x16 chunks in HashMap; face culling via block-mesh-rs, optional single-axis greedy merge, per-vertex AO baked at mesh time
-- **Rendering:** StandardMaterial with a procedural texture atlas (no custom WGSL shaders currently; assets/shaders/ is empty)
+- **Voxel storage:** 16x16x16 chunks in HashMap; face culling via block-mesh-rs, single-axis greedy merge (default on), per-vertex AO baked at mesh time; buildings baked into chunk generation
+- **Rendering:** `ExtendedMaterial<StandardMaterial, BlockArrayExtension>` sampling a 64-layer texture array via `assets/shaders/block_array.wgsl`; mesh carries UV_0 (tile-local) + UV_1.x (layer index)
 - **Entity system:** Bevy ECS
 - **UI:** Bevy UI nodes
 
@@ -50,7 +50,7 @@ src/
 ├── block_types.rs       # BlockType enum, colors, block-mesh traits
 ├── terrain.rs           # terrainHeightAt(), noise, naturalBlockAt(), voxel tree placement
 ├── chunk.rs             # Chunk storage, greedy mesh generation
-├── chunk_manager.rs     # Chunk load/unload, modifications, surface cache
+├── chunk_manager.rs     # Chunk load/unload, modifications, remesh queues
 ├── player.rs            # FPS camera, movement, collision, interaction
 ├── ray_cast.rs          # DDA ray casting
 ├── buildings.rs         # Procedural building placement
