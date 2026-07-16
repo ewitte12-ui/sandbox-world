@@ -50,6 +50,22 @@ pub struct DevSettings {
     /// Vertex ambient-occlusion strength: 0.0 = off, 1.0 = full corner
     /// darkening. Takes effect on newly (re)meshed chunks.
     pub ao_strength: f32,
+    /// Master switch for baked voxel lighting (per-voxel sky/block light
+    /// flood fill — see voxel_light.rs). When false, falls back to the
+    /// legacy lantern PointLight pool for A/B comparison. Toggling needs
+    /// NO remesh: meshes always carry light levels, the shader uniform
+    /// decides whether they apply.
+    pub voxel_lighting: bool,
+    /// Floor for the combined voxel-light factor so unlit areas render
+    /// very dark instead of pitch black.
+    pub voxel_light_min: f32,
+    /// Sky-light intensity at deepest night (moon/star floor for the
+    /// sun_intensity uniform).
+    pub voxel_sky_night: f32,
+    /// Max per-frame chunk light recomputes in process_light_queue
+    /// (cascades are budgeted like the deferred remesh queue; ×8 while
+    /// the loading overlay is up).
+    pub max_light_updates_per_frame: u32,
     pub show_fps: bool,
     /// Debug: draw chunk bounding boxes colored by face density. Toggle with F4.
     pub show_chunk_bounds: bool,
@@ -77,6 +93,10 @@ impl Default for DevSettings {
             animal_count: 60,
             max_chunk_meshes_per_frame: 8,
             ao_strength: 1.0,
+            voxel_lighting: true,
+            voxel_light_min: 0.04,
+            voxel_sky_night: 0.10,
+            max_light_updates_per_frame: 32,
             show_fps: true,
             show_chunk_bounds: false,
             highlight_greedy_quads: false,

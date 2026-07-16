@@ -59,7 +59,7 @@ impl Plugin for LightingPlugin {
             // the previous frame (PlayerPlugin updates camera in a separate
             // chained set). This 1-frame lag is acceptable because lighting
             // changes are gradual and visually imperceptible at 60fps.
-            .add_systems(Update, (update_sun_cycle, update_lantern_lights, apply_color_grading, apply_camera_settings, apply_render_pipeline_settings, apply_render_scale, adapt_shadows_for_fps_mode)
+            .add_systems(Update, (update_sun_cycle, update_lantern_lights, update_voxel_light_material, apply_color_grading, apply_camera_settings, apply_render_pipeline_settings, apply_render_scale, adapt_shadows_for_fps_mode)
                 .run_if(in_state(crate::GameState::Gameplay)));
     }
 }
@@ -283,6 +283,19 @@ fn update_lantern_lights(
     dev: Res<crate::dev_tools::DevSettings>,
     mut last_scan: Local<Option<(u64, IVec3)>>,
 ) {
+    // Baked voxel lighting replaces the point-light pool entirely: lantern
+    // glow is flood-filled into the mesh (no wall leaks, no 64-light cap,
+    // no per-light draw cost). The PointLight path remains behind the
+    // DevSettings toggle for A/B comparison.
+    if dev.voxel_lighting {
+        for (entity, _) in &existing {
+            commands.entity(entity).despawn();
+        }
+        // Force a rescan if the toggle is flipped back off.
+        *last_scan = None;
+        return;
+    }
+
     let Some(cam_gt) = cameras.iter().next() else {
         return;
     };
@@ -350,6 +363,55 @@ fn update_lantern_lights(
             Transform::from_translation(*lp),
         ));
         count += 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Voxel-light material uniform — couples baked sky light to the sun cycle
+// ---------------------------------------------------------------------------
+
+/// Push the day/night sun intensity (and the voxel-lighting toggle +
+/// minimum-light floor) into the shared chunk material's uniform. The
+/// mesh carries raw 0..15 light levels, so this per-frame uniform write
+/// is the ONLY thing the moving sun touches — no remesh, ever. The value
+/// is quantized so the material asset is not marked changed (and its
+/// bind group not re-prepared) every frame.
+fn update_voxel_light_material(
+    sun_cycle: Res<SunCycle>,
+    dev: Res<crate::dev_tools::DevSettings>,
+    chunk_material: Option<Res<crate::chunk_manager::ChunkMaterial>>,
+    mut materials: ResMut<Assets<crate::chunk_manager::BlockArrayMaterial>>,
+    mut last: Local<Option<Vec4>>,
+) {
+    let Some(mat_res) = chunk_material else {
+        return;
+    };
+
+    // Same sun geometry as update_sun_cycle.
+    let angle = sun_cycle.angle;
+    let sun_direction =
+        Vec3::new(angle.cos() * 0.5, angle.sin(), angle.cos() * 0.866).normalize();
+    let day_factor = smoothstep(-0.15, 0.2, sun_direction.y);
+
+    // Sky light never drops to zero — moon/stars keep outdoor areas
+    // navigable at night (tunable floor).
+    let night = dev.voxel_sky_night.clamp(0.0, 1.0);
+    let sun_intensity = night + (1.0 - night) * day_factor;
+    let quantized = (sun_intensity * 256.0).round() / 256.0;
+
+    let params = Vec4::new(
+        quantized,
+        if dev.voxel_lighting { 1.0 } else { 0.0 },
+        dev.voxel_light_min.clamp(0.0, 1.0),
+        0.0,
+    );
+    if *last == Some(params) {
+        return;
+    }
+    *last = Some(params);
+
+    if let Some(material) = materials.get_mut(&mat_res.handle) {
+        material.extension.light_params = params;
     }
 }
 

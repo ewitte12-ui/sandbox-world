@@ -34,6 +34,15 @@ pub struct BlockArrayExtension {
     #[texture(100, dimension = "2d_array")]
     #[sampler(101)]
     pub layers: Handle<Image>,
+    /// Voxel-lighting parameters, updated per frame by
+    /// lighting::update_voxel_light_material (so day/night never forces a
+    /// remesh — vertices carry raw sky/block light levels):
+    ///   x = sun intensity (0..1, scales the vertex SKY channel)
+    ///   y = voxel lighting enabled (1.0) / disabled (0.0)
+    ///   z = minimum light factor (floor so nothing is pitch black)
+    ///   w = unused
+    #[uniform(102)]
+    pub light_params: Vec4,
 }
 
 impl MaterialExtension for BlockArrayExtension {
@@ -118,6 +127,16 @@ pub struct ChunkManager {
     /// Cosmetic-latency work: processed a budgeted batch per frame so a
     /// bulk invalidation can't freeze a frame.
     deferred_remesh: HashSet<ChunkPos>,
+    /// Chunks whose voxel light must be recomputed THIS frame (player
+    /// edits — drained fully by process_light_queue before the edit's
+    /// same-frame remesh, so the new mesh bakes the new light).
+    light_dirty: HashSet<ChunkPos>,
+    /// Chunks whose voxel light is stale for cosmetic reasons (a light
+    /// cascade crossed their boundary, or a freshly loaded neighbor's
+    /// real light diverged from the terrain prediction they were lit
+    /// against). Budgeted like deferred_remesh; recomputes that change
+    /// nothing queue no further work, so cascades self-extinguish.
+    light_deferred: HashSet<ChunkPos>,
     /// Bumped whenever `modifications` changes (set_block / clear_all).
     /// Lets per-frame consumers (lantern lights) skip work when nothing changed.
     pub mods_version: u64,
@@ -137,6 +156,8 @@ impl Default for ChunkManager {
             pending: HashMap::new(),
             dirty_chunks: HashSet::new(),
             deferred_remesh: HashSet::new(),
+            light_dirty: HashSet::new(),
+            light_deferred: HashSet::new(),
             mods_version: 0,
             load_generation: 0,
         }
@@ -158,6 +179,8 @@ impl ChunkManager {
         self.pending.clear();
         self.dirty_chunks.clear();
         self.deferred_remesh.clear();
+        self.light_dirty.clear();
+        self.light_deferred.clear();
         self.modifications.clear();
         // Invalidate consumers' cached views of modifications / loaded chunks
         // so lantern lights re-scan and load_chunks re-fills the bubble.
@@ -209,30 +232,43 @@ impl ChunkManager {
             chunk.blocks[Chunk::index(local.x, local.y, local.z)] = block_type;
         }
 
-        // If the block is on a chunk boundary, also dirty the neighbor chunk
+        // A block edit invalidates this chunk's voxel light. The full
+        // 15-block light cascade into further chunks is handled by
+        // process_light_queue re-queueing neighbors whose boundary light
+        // actually changes — set_block only seeds the origin.
+        self.light_dirty.insert(chunk_pos);
+
+        // If the block is on a chunk boundary, also dirty the neighbor
+        // chunk — its mesh padding AND its light input both read this block.
+        let mut boundary_neighbor = |dirty: &mut HashSet<ChunkPos>,
+                                     light: &mut HashSet<ChunkPos>,
+                                     pos: ChunkPos| {
+            dirty.insert(pos);
+            light.insert(pos);
+        };
         if local.x == 0 {
-            self.dirty_chunks
-                .insert(ChunkPos(chunk_pos.0 - 1, chunk_pos.1, chunk_pos.2));
+            boundary_neighbor(&mut self.dirty_chunks, &mut self.light_dirty,
+                ChunkPos(chunk_pos.0 - 1, chunk_pos.1, chunk_pos.2));
         }
         if local.x == CHUNK_SIZE - 1 {
-            self.dirty_chunks
-                .insert(ChunkPos(chunk_pos.0 + 1, chunk_pos.1, chunk_pos.2));
+            boundary_neighbor(&mut self.dirty_chunks, &mut self.light_dirty,
+                ChunkPos(chunk_pos.0 + 1, chunk_pos.1, chunk_pos.2));
         }
         if local.y == 0 {
-            self.dirty_chunks
-                .insert(ChunkPos(chunk_pos.0, chunk_pos.1 - 1, chunk_pos.2));
+            boundary_neighbor(&mut self.dirty_chunks, &mut self.light_dirty,
+                ChunkPos(chunk_pos.0, chunk_pos.1 - 1, chunk_pos.2));
         }
         if local.y == CHUNK_SIZE - 1 {
-            self.dirty_chunks
-                .insert(ChunkPos(chunk_pos.0, chunk_pos.1 + 1, chunk_pos.2));
+            boundary_neighbor(&mut self.dirty_chunks, &mut self.light_dirty,
+                ChunkPos(chunk_pos.0, chunk_pos.1 + 1, chunk_pos.2));
         }
         if local.z == 0 {
-            self.dirty_chunks
-                .insert(ChunkPos(chunk_pos.0, chunk_pos.1, chunk_pos.2 - 1));
+            boundary_neighbor(&mut self.dirty_chunks, &mut self.light_dirty,
+                ChunkPos(chunk_pos.0, chunk_pos.1, chunk_pos.2 - 1));
         }
         if local.z == CHUNK_SIZE - 1 {
-            self.dirty_chunks
-                .insert(ChunkPos(chunk_pos.0, chunk_pos.1, chunk_pos.2 + 1));
+            boundary_neighbor(&mut self.dirty_chunks, &mut self.light_dirty,
+                ChunkPos(chunk_pos.0, chunk_pos.1, chunk_pos.2 + 1));
         }
     }
 
@@ -246,11 +282,15 @@ impl ChunkManager {
         }
     }
 
-    /// True when no generation tasks are in flight and no remesh work is
-    /// queued — used by the dev screenshot harness to wait for a fully
-    /// streamed-in world before capturing.
+    /// True when no generation tasks are in flight and no remesh or
+    /// relight work is queued — used by the dev screenshot harness to
+    /// wait for a fully streamed-in world before capturing.
     pub fn streaming_idle(&self) -> bool {
-        self.pending.is_empty() && self.dirty_chunks.is_empty() && self.deferred_remesh.is_empty()
+        self.pending.is_empty()
+            && self.dirty_chunks.is_empty()
+            && self.deferred_remesh.is_empty()
+            && self.light_dirty.is_empty()
+            && self.light_deferred.is_empty()
     }
 }
 
@@ -285,17 +325,20 @@ impl Plugin for ChunkManagerPlugin {
             // ORDERING CONTRACT: chained because each stage depends on the previous:
             //   1. load_chunks           — spawns async gen tasks for missing chunks
             //   2. handle_chunk_tasks    — polls completed tasks, inserts chunk data + mesh
-            //   3. remesh_dirty_chunks   — rebuilds meshes for modified chunks
-            //   4. unload_chunks         — despawns chunks beyond render distance
-            //   5. apply_texture_settings_change — rebuilds layers on texture_size
+            //   3. process_light_queue   — recomputes voxel light for edited/stale
+            //      chunks BEFORE remesh, so same-frame remeshes bake the new light
+            //   4. remesh_dirty_chunks   — rebuilds meshes for modified chunks
+            //   5. unload_chunks         — despawns chunks beyond render distance
+            //   6. apply_texture_settings_change — rebuilds layers on texture_size
             //      change, swaps sampler on anisotropy change
-            // Step 5 must run after meshing so new meshes get the correct material.
+            // Step 6 must run after meshing so new meshes get the correct material.
             .add_systems(
                 Update,
                 (
                     on_block_registry_changed,
                     load_chunks,
                     handle_chunk_tasks,
+                    process_light_queue,
                     remesh_dirty_chunks,
                     unload_chunks,
                     apply_texture_settings_change,
@@ -513,6 +556,9 @@ fn setup_chunk_material(
         },
         extension: BlockArrayExtension {
             layers: image_handle.clone(),
+            // Daytime defaults; update_voxel_light_material takes over on
+            // the first Gameplay frame.
+            light_params: Vec4::new(1.0, 1.0, 0.04, 0.0),
         },
     });
 
@@ -941,11 +987,30 @@ fn handle_chunk_tasks(
                     manager.chunk_data.get(&ChunkPos(pos.0, pos.1, pos.2 + 1)),
                 ],
             };
+            // Voxel light BEFORE the mesh: build_mesh bakes per-vertex
+            // light from chunk.light (chunk_data INVARIANT: light is
+            // always computed before the first mesh build). The gathered
+            // shell is reused by build_mesh below — gathering costs up to
+            // ~324 surface_y calls at the render edge.
+            let shell = crate::voxel_light::gather_shell_light(pos, &loaded_neighbors);
+            chunk.light = crate::voxel_light::compute_light(&chunk.blocks, &shell);
+            // Already-lit neighbors were computed against a terrain
+            // PREDICTION of this chunk's light. Where the real thing
+            // disagrees (≥2-level seam jump: tree shade, lantern glow,
+            // edits), queue them for a relight — a recompute that changes
+            // nothing costs one BFS and queues no remesh.
+            let mut stale_faces = [false; 6];
+            for (face, n) in loaded_neighbors.neighbors.iter().enumerate() {
+                if let Some(n) = n {
+                    stale_faces[face] = crate::voxel_light::seam_stale(&chunk, face, n);
+                }
+            }
             let mesh = chunk.build_mesh(
                 &loaded_neighbors,
                 opt_flags.enable_greedy_meshing,
                 dev.highlight_greedy_quads,
                 dev.ao_strength,
+                Some(&shell),
             );
 
             // NOTE: a solid chunk with 0 vertices is NORMAL here — fully
@@ -995,20 +1060,21 @@ fn handle_chunk_tasks(
             manager.pending.remove(&pos);
 
             // Queue deferred remeshes for already-meshed neighbors on faces
-            // where this chunk diverges from raw terrain. They meshed
-            // against terrain-predicted padding (build_mesh shell fill) and
-            // are correct everywhere else, so untouched-terrain boundaries
-            // (the vast majority) trigger nothing.
-            const FACE_OFFSETS: [(i32, i32, i32); 6] = [
-                (-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1),
-            ];
-            for (face, &(dx, dy, dz)) in FACE_OFFSETS.iter().enumerate() {
-                if !boundary_mask[face] {
+            // where this chunk diverges from raw terrain (they meshed
+            // against terrain-predicted padding — build_mesh shell fill),
+            // and deferred relights on faces where this chunk's real light
+            // diverges from the prediction they were lit against. Untouched
+            // terrain boundaries (the vast majority) trigger nothing.
+            for (face, &(dx, dy, dz)) in crate::voxel_light::FACE_OFFSETS.iter().enumerate() {
+                if !boundary_mask[face] && !stale_faces[face] {
                     continue;
                 }
                 let npos = ChunkPos(pos.0 + dx, pos.1 + dy, pos.2 + dz);
-                if manager.chunks.contains_key(&npos) {
+                if boundary_mask[face] && manager.chunks.contains_key(&npos) {
                     manager.deferred_remesh.insert(npos);
+                }
+                if stale_faces[face] && manager.chunk_data.contains_key(&npos) {
+                    manager.light_deferred.insert(npos);
                 }
             }
 
@@ -1017,6 +1083,102 @@ fn handle_chunk_tasks(
                 "Chunk MESH: ({},{},{}) entity={:?} verts={}",
                 pos.0, pos.1, pos.2, entity, _vert_count,
             );
+        }
+    }
+}
+
+/// System: recompute voxel light for queued chunks (see voxel_light.rs
+/// module docs for the per-chunk-recompute relaxation model).
+///
+/// The immediate set (light_dirty, seeded by set_block) is fully drained
+/// so the same-frame remesh of an edited chunk bakes the new light. The
+/// deferred set (light_deferred: cross-chunk cascades + seam
+/// reconciliation on chunk load) is budgeted per frame like
+/// deferred_remesh. A recompute whose result is unchanged queues nothing,
+/// so cascades self-extinguish; one that changes boundary light re-queues
+/// only the neighbors behind the changed faces — fixed-point relaxation
+/// that converges because unsupported light strictly decays each
+/// round-trip.
+fn process_light_queue(
+    mut manager: ResMut<ChunkManager>,
+    dev: Res<crate::dev_tools::DevSettings>,
+    world_ready: Option<Res<crate::player::WorldReady>>,
+) {
+    if manager.light_dirty.is_empty() && manager.light_deferred.is_empty() {
+        return;
+    }
+
+    // Same pre-ready boost as meshing: while the loading overlay is up
+    // there is nothing on screen a hitch could disturb.
+    let ready = world_ready.map(|r| r.0).unwrap_or(true);
+    let base_budget = dev.max_light_updates_per_frame.max(1) as usize;
+    let budget = if ready { base_budget } else { base_budget * 8 };
+
+    let mut work: Vec<ChunkPos> = manager.light_dirty.drain().collect();
+    for p in &work {
+        manager.light_deferred.remove(p);
+    }
+    if work.len() < budget && !manager.light_deferred.is_empty() {
+        let take = budget - work.len();
+        let batch: Vec<ChunkPos> = manager
+            .light_deferred
+            .iter()
+            .copied()
+            .filter(|p| !work.contains(p))
+            .take(take)
+            .collect();
+        for p in &batch {
+            manager.light_deferred.remove(p);
+        }
+        work.extend(batch);
+    }
+
+    for pos in work {
+        let result = {
+            let Some(chunk) = manager.chunk_data.get(&pos) else {
+                continue; // unloaded while queued — nothing to do
+            };
+            let neighbors = ChunkNeighbors {
+                neighbors: [
+                    manager.chunk_data.get(&ChunkPos(pos.0 - 1, pos.1, pos.2)),
+                    manager.chunk_data.get(&ChunkPos(pos.0 + 1, pos.1, pos.2)),
+                    manager.chunk_data.get(&ChunkPos(pos.0, pos.1 - 1, pos.2)),
+                    manager.chunk_data.get(&ChunkPos(pos.0, pos.1 + 1, pos.2)),
+                    manager.chunk_data.get(&ChunkPos(pos.0, pos.1, pos.2 - 1)),
+                    manager.chunk_data.get(&ChunkPos(pos.0, pos.1, pos.2 + 1)),
+                ],
+            };
+            let new_light =
+                crate::voxel_light::compute_chunk_light(&chunk.blocks, pos, &neighbors);
+            if new_light == chunk.light {
+                None
+            } else {
+                let faces =
+                    crate::voxel_light::boundary_faces_changed(&chunk.light, &new_light);
+                Some((faces, new_light))
+            }
+        };
+        let Some((changed_faces, new_light)) = result else {
+            continue;
+        };
+        if let Some(chunk) = manager.chunk_data.get_mut(&pos) {
+            chunk.light = new_light;
+        }
+        // Bake the new light into the mesh. Edited chunks are already in
+        // dirty_chunks (same-frame remesh, this system runs just before
+        // remesh_dirty_chunks); cascade-only changes take the budgeted
+        // deferred path.
+        if !manager.dirty_chunks.contains(&pos) {
+            manager.deferred_remesh.insert(pos);
+        }
+        for (face, &(dx, dy, dz)) in crate::voxel_light::FACE_OFFSETS.iter().enumerate() {
+            if !changed_faces[face] {
+                continue;
+            }
+            let npos = ChunkPos(pos.0 + dx, pos.1 + dy, pos.2 + dz);
+            if manager.chunk_data.contains_key(&npos) {
+                manager.light_deferred.insert(npos);
+            }
         }
     }
 }
@@ -1102,6 +1264,7 @@ fn remesh_dirty_chunks(
                 opt_flags.enable_greedy_meshing,
                 dev.highlight_greedy_quads,
                 dev.ao_strength,
+                None, // light is current — build_mesh gathers its own shell
             )
         } else {
             // Defensive fallback: tracked chunk without stored data (should
@@ -1120,11 +1283,14 @@ fn remesh_dirty_chunks(
                         manager.chunk_data.get(&ChunkPos(pos.0, pos.1, pos.2 + 1)),
                     ],
                 };
+                let shell = crate::voxel_light::gather_shell_light(pos, &neighbors);
+                chunk.light = crate::voxel_light::compute_light(&chunk.blocks, &shell);
                 chunk.build_mesh(
                     &neighbors,
                     opt_flags.enable_greedy_meshing,
                     dev.highlight_greedy_quads,
                     dev.ao_strength,
+                    Some(&shell),
                 )
             };
             manager.chunk_data.insert(pos, chunk);
@@ -1205,6 +1371,8 @@ fn unload_chunks(
         }
         manager.dirty_chunks.remove(&pos);
         manager.deferred_remesh.remove(&pos);
+        manager.light_dirty.remove(&pos);
+        manager.light_deferred.remove(&pos);
     }
 }
 

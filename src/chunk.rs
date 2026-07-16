@@ -36,6 +36,13 @@ pub struct ChunkNeighbors<'a> {
 /// A 16x16x16 voxel chunk.
 pub struct Chunk {
     pub blocks: [BlockType; CHUNK_VOLUME],
+    /// Packed voxel light (sky high nibble, block low nibble — see
+    /// voxel_light). Zeroed at generation; computed on the main thread
+    /// when the chunk is inserted (handle_chunk_tasks) and kept current
+    /// by process_light_queue. INVARIANT: every chunk in
+    /// ChunkManager::chunk_data has had its light computed before its
+    /// first mesh build.
+    pub light: [u8; CHUNK_VOLUME],
     pub pos: ChunkPos,
 }
 
@@ -98,7 +105,7 @@ impl Chunk {
         let boundary_mask: [bool; 6] =
             std::array::from_fn(|i| tree_mask[i] || building_mask[i]);
 
-        (Chunk { blocks, pos }, boundary_mask)
+        (Chunk { blocks, light: [0; CHUNK_VOLUME], pos }, boundary_mask)
     }
 
     /// Build a Bevy Mesh from this chunk's block data.
@@ -117,15 +124,21 @@ impl Chunk {
     /// handle_chunk_tasks. UV_0 is tile-local (0..1 per block face, 0..w
     /// along greedy-merged runs — sampled with a repeating sampler);
     /// UV_1.x carries the block's texture-array layer index, constant per
-    /// quad (see chunk_manager::BlockArrayExtension). Per-vertex color
-    /// carries face brightness × baked ambient occlusion (vertex_ao /
-    /// ao_strength).
+    /// quad (see chunk_manager::BlockArrayExtension). UV_1.y carries the
+    /// vertex SKY light (0..1) and COLOR alpha the vertex BLOCK light
+    /// (0..1) — combined in the shader with the live sun-intensity
+    /// uniform so day/night needs no remesh. COLOR rgb carries face
+    /// brightness × baked ambient occlusion (vertex_ao / ao_strength).
+    /// `shell_light`: pass the ShellLight already gathered for this
+    /// chunk's light recompute to avoid a second ~324-`surface_y` gather;
+    /// None gathers one internally (remesh paths where light is current).
     pub fn build_mesh(
         &self,
         neighbors: &ChunkNeighbors,
         greedy: bool,
         highlight_greedy: bool,
         ao_strength: f32,
+        shell_light: Option<&crate::voxel_light::ShellLight>,
     ) -> Mesh {
         let ao_strength = ao_strength.clamp(0.0, 1.0);
         // Build padded 18x18x18 voxel buffer
@@ -294,6 +307,36 @@ impl Chunk {
             }
         }
 
+        // Padded voxel-light grids, mirroring the block padding: interior
+        // from this chunk's computed light, shell from neighbor light or
+        // terrain-predicted sky (voxel_light::gather_shell_light — the
+        // same prediction rule the light BFS itself uses, so mesh
+        // sampling and light computation always agree at seams).
+        let owned_shell;
+        let shell_light = match shell_light {
+            Some(shell) => shell,
+            None => {
+                owned_shell = crate::voxel_light::gather_shell_light(self.pos, neighbors);
+                &owned_shell
+            }
+        };
+        let mut padded_sky = shell_light.sky;
+        let mut padded_blk = shell_light.blk;
+        for z in 0..CHUNK_SIZE {
+            for y in 0..CHUNK_SIZE {
+                for x in 0..CHUNK_SIZE {
+                    let l = self.light[Self::index(x, y, z)];
+                    let pi = crate::voxel_light::pidx(
+                        (x + 1) as usize,
+                        (y + 1) as usize,
+                        (z + 1) as usize,
+                    );
+                    padded_sky[pi] = crate::voxel_light::sky(l);
+                    padded_blk[pi] = crate::voxel_light::blk(l);
+                }
+            }
+        }
+
         // Debug: verify AIR padding is non-opaque. If AIR were opaque,
         // all boundary faces would be incorrectly culled.
         #[cfg(debug_assertions)]
@@ -376,13 +419,81 @@ impl Chunk {
             }
         };
 
+        // --- Vertex voxel light (smooth lighting) ------------------------
+        // Same sample points as vertex_ao: the face-front cell plus the
+        // two edge and one corner cell on the air side of the vertex.
+        // Averages the sky/block light of the non-opaque samples (the
+        // corner is unreachable when both edges are opaque — matching the
+        // AO pinch rule), quantized to u8 (0..=255 ≙ light 0..=15) so
+        // greedy merging can compare runs exactly.
+        let light_of = |p: [i32; 3]| -> Option<(u8, u8)> {
+            if p.iter().any(|c| !(0..18).contains(c)) {
+                return None;
+            }
+            let bi = PaddedChunkShape::linearize([p[0] as u32, p[1] as u32, p[2] as u32]);
+            if padded[bi as usize].is_opaque() {
+                return None;
+            }
+            let pi = crate::voxel_light::pidx(p[0] as usize, p[1] as usize, p[2] as usize);
+            Some((padded_sky[pi], padded_blk[pi]))
+        };
+        let vertex_light = |voxel: [u32; 3],
+                            norm_ax: usize,
+                            norm_sign: i32,
+                            ax_u: usize,
+                            ax_v: usize,
+                            cu: bool,
+                            cv: bool|
+         -> [u8; 2] {
+            let mut base = [voxel[0] as i32, voxel[1] as i32, voxel[2] as i32];
+            base[norm_ax] += norm_sign;
+            let du: i32 = if cu { 1 } else { -1 };
+            let dv: i32 = if cv { 1 } else { -1 };
+            let mut s1 = base;
+            s1[ax_u] += du;
+            let mut s2 = base;
+            s2[ax_v] += dv;
+            let mut corner = base;
+            corner[ax_u] += du;
+            corner[ax_v] += dv;
+
+            let (mut sum_s, mut sum_b, mut n) = (0u32, 0u32, 0u32);
+            let mut add = |c: Option<(u8, u8)>| {
+                if let Some((s, b)) = c {
+                    sum_s += s as u32;
+                    sum_b += b as u32;
+                    n += 1;
+                }
+            };
+            // The face-front cell is non-opaque by face visibility, so
+            // n >= 1 whenever the face exists.
+            add(light_of(base));
+            let l1 = light_of(s1);
+            let l2 = light_of(s2);
+            add(l1);
+            add(l2);
+            if l1.is_some() || l2.is_some() {
+                add(light_of(corner));
+            }
+            if n == 0 {
+                return [0, 0];
+            }
+            let q = |sum: u32| -> u8 {
+                ((sum as f32 / n as f32) / 15.0 * 255.0).round().clamp(0.0, 255.0) as u8
+            };
+            [q(sum_s), q(sum_b)]
+        };
+
         // Helper: emit a single quad into the mesh buffers.
         // `corners` are 4 face corners in padded space, in ANY order — the
         // helper classifies them into ring order on (ax_u, ax_v), fixes
         // winding against `normal`, and picks the triangulation diagonal
         // from per-corner AO (split along the DARKER diagonal so the
         // crease passes through the dark corner instead of an X artifact).
-        // `ao` holds final brightness multipliers aligned with `corners`.
+        // `ao` holds final brightness multipliers aligned with `corners`;
+        // `light` holds quantized (sky, block) voxel light per corner —
+        // emitted as UV_1.y (sky) and COLOR alpha (block), both 0..1, so
+        // the fragment shader can combine them with the live sun uniform.
         let mut emit_quad = |
             positions: &mut Vec<[f32; 3]>,
             normals: &mut Vec<[f32; 3]>,
@@ -391,6 +502,7 @@ impl Chunk {
             indices: &mut Vec<u32>,
             corners: [[f32; 3]; 4],
             ao: [f32; 4],
+            light: [[u8; 2]; 4],
             normal: [f32; 3],
             face_brightness: f32,
             layer: f32,
@@ -408,7 +520,7 @@ impl Chunk {
                 min_v = min_v.min(c[ax_v]);
                 max_v = max_v.max(c[ax_v]);
             }
-            for (c, a) in corners.iter().zip(ao.iter()) {
+            for ((c, a), l) in corners.iter().zip(ao.iter()).zip(light.iter()) {
                 positions.push([c[0] - 1.0, c[1] - 1.0, c[2] - 1.0]);
                 // Tile-local UVs: 0..1 per block cell, 0..w across a greedy
                 // run. The repeating sampler tiles the block's array layer
@@ -416,10 +528,10 @@ impl Chunk {
                 let lu = c[ax_u] - min_u;
                 let lv = c[ax_v] - min_v;
                 uvs.push([lu, lv]);
-                layer_uvs.push([layer, 0.0]);
+                layer_uvs.push([layer, l[0] as f32 / 255.0]);
                 normals.push(normal);
                 let b = face_brightness * a;
-                colors.push([b, b, b, 1.0]);
+                colors.push([b, b, b, l[1] as f32 / 255.0]);
             }
             // Ring classification: which pushed corner sits at each
             // (u, v) extreme — ring order (0,0), (1,0), (1,1), (0,1).
@@ -508,19 +620,24 @@ impl Chunk {
                             if p[a] > max_pos[a] { max_pos[a] = p[a]; }
                         }
                     }
-                    // Per-corner AO, aligned with mesh_positions order.
+                    // Per-corner AO + voxel light, aligned with
+                    // mesh_positions order.
                     let mut ao = [1.0f32; 4];
+                    let mut light = [[0u8; 2]; 4];
                     for (i, p) in mesh_positions.iter().enumerate() {
                         let cu = p[ax_u] > (min_pos[ax_u] + max_pos[ax_u]) * 0.5;
                         let cv = p[ax_v] > (min_pos[ax_v] + max_pos[ax_v]) * 0.5;
                         ao[i] = ao_curve(vertex_ao(
                             unit_quad.minimum, norm_ax, norm_sign, ax_u, ax_v, cu, cv,
                         ));
+                        light[i] = vertex_light(
+                            unit_quad.minimum, norm_ax, norm_sign, ax_u, ax_v, cu, cv,
+                        );
                     }
                     emit_quad(
                         &mut positions, &mut normals, &mut colors, &mut uvs, &mut indices,
                         [mesh_positions[0], mesh_positions[1], mesh_positions[2], mesh_positions[3]],
-                        ao, normal_arr, face_brightness,
+                        ao, light, normal_arr, face_brightness,
                         layer, ax_u, ax_v,
                     );
                 }
@@ -529,13 +646,15 @@ impl Chunk {
                 // Collect visible faces into a sparse map keyed by (normal_pos, v),
                 // then scan along U to merge consecutive same-type runs.
                 //
-                // Faces also carry their 4-corner AO tuple (ring order) —
-                // two faces only merge when their tuples are identical, so
-                // the merged quad's interpolated AO is exactly what the
-                // individual quads would have shown. Uniform open terrain
-                // (AO = 3 everywhere) merges as before; runs stop at AO
-                // transitions like wall bases and ledges.
-                let mut rows: HashMap<(u32, u32), Vec<(u32, BlockType, [u8; 4])>> = HashMap::new();
+                // Faces also carry their 4-corner AO and voxel-light
+                // tuples (ring order) — two faces only merge when BOTH
+                // tuples are identical, so the merged quad's interpolated
+                // AO/light is exactly what the individual quads would have
+                // shown. Uniform open terrain (AO = 3, sky = 15
+                // everywhere) merges as before; runs stop at AO or light
+                // transitions like wall bases, ledges, and lantern glow.
+                type FaceRun = (u32, BlockType, [u8; 4], [[u8; 2]; 4]);
+                let mut rows: HashMap<(u32, u32), Vec<FaceRun>> = HashMap::new();
 
                 for unit_quad in group.iter() {
                     let min = unit_quad.minimum;
@@ -547,6 +666,13 @@ impl Chunk {
                         vertex_ao(min, norm_ax, norm_sign, ax_u, ax_v, true, false),
                         vertex_ao(min, norm_ax, norm_sign, ax_u, ax_v, true, true),
                         vertex_ao(min, norm_ax, norm_sign, ax_u, ax_v, false, true),
+                    ];
+                    // Ring-order voxel light, same corner order as ao_t.
+                    let light_t = [
+                        vertex_light(min, norm_ax, norm_sign, ax_u, ax_v, false, false),
+                        vertex_light(min, norm_ax, norm_sign, ax_u, ax_v, true, false),
+                        vertex_light(min, norm_ax, norm_sign, ax_u, ax_v, true, true),
+                        vertex_light(min, norm_ax, norm_sign, ax_u, ax_v, false, true),
                     ];
 
                     // Skip emissive/transparent blocks — never merge them.
@@ -565,6 +691,7 @@ impl Chunk {
                             }
                         }
                         let mut ao = [1.0f32; 4];
+                        let mut light = [[0u8; 2]; 4];
                         for (i, p) in mesh_positions.iter().enumerate() {
                             let cu = p[ax_u] > (min_p[ax_u] + max_p[ax_u]) * 0.5;
                             let cv = p[ax_v] > (min_p[ax_v] + max_p[ax_v]) * 0.5;
@@ -575,11 +702,12 @@ impl Chunk {
                                 (false, true) => 3,
                             };
                             ao[i] = ao_curve(ao_t[ring_slot]);
+                            light[i] = light_t[ring_slot];
                         }
                         emit_quad(
                             &mut positions, &mut normals, &mut colors, &mut uvs, &mut indices,
                             [mesh_positions[0], mesh_positions[1], mesh_positions[2], mesh_positions[3]],
-                            ao, normal_arr, face_brightness,
+                            ao, light, normal_arr, face_brightness,
                             voxel.index() as f32,
                             ax_u, ax_v,
                         );
@@ -591,7 +719,7 @@ impl Chunk {
                     let u_coord = min[ax_u];
                     rows.entry((slice_coord, v_coord))
                         .or_default()
-                        .push((u_coord, voxel, ao_t));
+                        .push((u_coord, voxel, ao_t, light_t));
                 }
 
                 // Debug: track which faces the greedy merge covers.
@@ -602,11 +730,11 @@ impl Chunk {
 
                 // For each row, sort by U and merge consecutive same-type runs.
                 for ((_slice, _v), mut row) in rows {
-                    row.sort_by_key(|&(u, _, _)| u);
+                    row.sort_by_key(|&(u, _, _, _)| u);
 
                     let mut i = 0;
                     while i < row.len() {
-                        let (start_u, block, run_ao) = row[i];
+                        let (start_u, block, run_ao, run_light) = row[i];
                         let mut end_u = start_u;
 
                         // Extend along U while:
@@ -615,8 +743,8 @@ impl Chunk {
                         //   - stays within chunk interior (padded 1..16, not into padding)
                         //   - same emissive status (never merge lit + unlit)
                         //   - same opacity (defensive — both should be opaque here)
-                        //   - identical AO tuple (constant along the run, so the
-                        //     merged quad interpolates AO exactly)
+                        //   - identical AO and voxel-light tuples (constant along
+                        //     the run, so the merged quad interpolates exactly)
                         while i + 1 < row.len()
                             && row[i + 1].0 == end_u + 1
                             && row[i + 1].1 == block
@@ -624,6 +752,7 @@ impl Chunk {
                             && row[i + 1].1.is_emissive() == block.is_emissive()
                             && row[i + 1].1.is_opaque() == block.is_opaque()
                             && row[i + 1].2 == run_ao
+                            && row[i + 1].3 == run_light
                         {
                             end_u = row[i + 1].0;
                             i += 1;
@@ -696,8 +825,8 @@ impl Chunk {
                             face_brightness
                         };
                         // Corners c0..c3 are built in ring order, matching
-                        // run_ao's ring order — and the tuple is constant
-                        // along the run, so endpoint AO is exact.
+                        // run_ao/run_light's ring order — and the tuples are
+                        // constant along the run, so endpoint values are exact.
                         let ao = [
                             ao_curve(run_ao[0]),
                             ao_curve(run_ao[1]),
@@ -707,7 +836,7 @@ impl Chunk {
                         emit_quad(
                             &mut positions, &mut normals, &mut colors, &mut uvs, &mut indices,
                             [c0, c1, c2, c3],
-                            ao, normal_arr, greedy_brightness,
+                            ao, run_light, normal_arr, greedy_brightness,
                             block.index() as f32,
                             ax_u, ax_v,
                         );
@@ -901,7 +1030,7 @@ mod tests {
         // block is >= 33 deep — solid rock, surrounded by solid rock.
         let chunk = Chunk::generate(ChunkPos(0, -3, 0));
         assert!(chunk.blocks.iter().all(|b| *b != BlockType::AIR));
-        let mesh = chunk.build_mesh(&NO_NEIGHBORS, false, false, 1.0);
+        let mesh = chunk.build_mesh(&NO_NEIGHBORS, false, false, 1.0, None);
         let (verts, _) = mesh_stats(&mesh);
         assert_eq!(verts, 0, "buried chunk emitted {} hidden-wall vertices", verts);
     }
@@ -911,7 +1040,7 @@ mod tests {
     fn sky_chunk_produces_no_geometry() {
         let chunk = Chunk::generate(ChunkPos(0, 10, 0));
         assert!(chunk.blocks.iter().all(|b| *b == BlockType::AIR));
-        let (verts, _) = mesh_stats(&chunk.build_mesh(&NO_NEIGHBORS, false, false, 1.0));
+        let (verts, _) = mesh_stats(&chunk.build_mesh(&NO_NEIGHBORS, false, false, 1.0, None));
         assert_eq!(verts, 0);
     }
 
@@ -922,7 +1051,7 @@ mod tests {
     fn surface_chunk_mesh_is_well_formed() {
         let chunk = Chunk::generate(ChunkPos(0, 0, 0));
         for greedy in [false, true] {
-            let mesh = chunk.build_mesh(&NO_NEIGHBORS, greedy, false, 1.0);
+            let mesh = chunk.build_mesh(&NO_NEIGHBORS, greedy, false, 1.0, None);
             let (verts, index_count) = mesh_stats(&mesh);
             assert!(verts > 0, "surface chunk produced no geometry (greedy={greedy})");
             assert_eq!(index_count % 3, 0);
@@ -945,8 +1074,8 @@ mod tests {
     #[test]
     fn greedy_never_exceeds_naive() {
         let chunk = Chunk::generate(ChunkPos(3, 0, -2));
-        let naive = chunk.build_mesh(&NO_NEIGHBORS, false, false, 1.0).count_vertices();
-        let greedy = chunk.build_mesh(&NO_NEIGHBORS, true, false, 1.0).count_vertices();
+        let naive = chunk.build_mesh(&NO_NEIGHBORS, false, false, 1.0, None).count_vertices();
+        let greedy = chunk.build_mesh(&NO_NEIGHBORS, true, false, 1.0, None).count_vertices();
         assert!(greedy <= naive, "greedy {} > naive {}", greedy, naive);
     }
 
@@ -955,7 +1084,7 @@ mod tests {
     #[test]
     fn ao_strength_zero_matches_flat_shading() {
         let chunk = Chunk::generate(ChunkPos(0, 0, 0));
-        let mesh = chunk.build_mesh(&NO_NEIGHBORS, false, false, 0.0);
+        let mesh = chunk.build_mesh(&NO_NEIGHBORS, false, false, 0.0, None);
         let Some(bevy::mesh::VertexAttributeValues::Float32x4(colors)) =
             mesh.attribute(Mesh::ATTRIBUTE_COLOR)
         else {

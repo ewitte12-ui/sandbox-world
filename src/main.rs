@@ -14,6 +14,7 @@ mod settings;
 mod sky;
 mod terrain;
 mod ui;
+mod voxel_light;
 // NOTE: entity-based trees (formerly trees.rs) were removed — they were
 // never registered as a plugin, and the live trees are voxel blocks baked
 // into chunks by terrain::place_trees_in_chunk.

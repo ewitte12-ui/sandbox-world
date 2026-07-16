@@ -383,19 +383,44 @@ fn auto_load_game(
     apply_save_data(&mut chunk_manager);
 }
 
+/// Minimum count of AIR-only modifications in one chunk before the
+/// corruption guard treats the chunk as a mass-despawn artifact. Half the
+/// chunk volume (2048 blocks): real corruption AIR'd out entire chunks,
+/// while legitimate digging rarely hollows out half a chunk without
+/// placing a single block. (The previous predicate, `solid == 0 && air >
+/// 0`, tripped on a SINGLE dig — once buildings stopped being
+/// modifications, any dig-only chunk silently reverted on reload.)
+///
+/// KNOWN TRADEOFF: a player who excavates >2048 blocks of one chunk
+/// without placing anything still loses that chunk on reload. Placing a
+/// single block in the chunk exempts it. A smarter guard would need save
+/// versioning or a checksum — deferred.
+const CORRUPT_AIR_ONLY_THRESHOLD: u32 = (crate::chunk::CHUNK_VOLUME as u32) / 2;
+
+/// True when a chunk's saved modifications look like mass-despawn
+/// corruption: AIR-only AND covering at least half the chunk volume.
+fn is_corrupt_bucket(air: u32, solid: u32) -> bool {
+    solid == 0 && air >= CORRUPT_AIR_ONLY_THRESHOLD
+}
+
 /// Load game state from the default save and apply it.
-fn apply_save_data(
-    chunk_manager: &mut ResMut<ChunkManager>,
-) {
+fn apply_save_data(chunk_manager: &mut ChunkManager) {
     let Some(save) = read_default_save() else {
         info!("No save file found, starting fresh.");
         return;
     };
+    apply_loaded_save(&save, chunk_manager);
+}
 
-    // --- Pass 1: bucket modifications by chunk, identify 100%-AIR chunks ---
-    // A chunk whose saved modifications are ALL AIR and contain no solid
-    // blocks is likely corruption (e.g., a mass-despawn wrote AIR over
-    // generated terrain). These are skipped to prevent terrain destruction.
+/// Apply a decoded save's modifications through set_block (the sole
+/// modification write path), skipping chunks flagged by the corruption
+/// guard. Split from apply_save_data so the guard is unit-testable.
+fn apply_loaded_save(save: &LoadedSave, chunk_manager: &mut ChunkManager) -> (u32, u32) {
+    // --- Pass 1: bucket modifications by chunk, flag mass-AIR chunks ---
+    // A chunk whose saved modifications are ALL AIR and cover at least
+    // half the chunk volume is likely corruption (e.g., a mass-despawn
+    // wrote AIR over generated terrain). These are skipped to prevent
+    // terrain destruction. Smaller AIR-only sets are normal digging.
     use std::collections::HashMap;
     let cs = crate::chunk::CHUNK_SIZE;
 
@@ -412,9 +437,9 @@ fn apply_save_data(
         }
     }
 
-    // Collect the set of corrupt (100%-AIR) chunk keys.
+    // Collect the set of corrupt (mass-AIR) chunk keys.
     let corrupt_chunks: std::collections::HashSet<(i32, i32, i32)> = buckets.iter()
-        .filter(|(_, b)| b.solid == 0 && b.air > 0)
+        .filter(|(_, b)| is_corrupt_bucket(b.air, b.solid))
         .map(|(&k, _)| k)
         .collect();
 
@@ -445,8 +470,8 @@ fn apply_save_data(
             let b = &buckets[&(cx, cy, cz)];
             warn!(
                 "Save corruption guard: skipped chunk ({},{},{}) — {} AIR-only mods \
-                 (would overwrite generated terrain)",
-                cx, cy, cz, b.air,
+                 (≥{} looks like mass-despawn, would overwrite generated terrain)",
+                cx, cy, cz, b.air, CORRUPT_AIR_ONLY_THRESHOLD,
             );
         }
         warn!(
@@ -467,7 +492,7 @@ fn apply_save_data(
         for (&(cx, cy, cz), b) in &sorted {
             let total = b.air + b.solid;
             let status = if corrupt_chunks.contains(&(cx, cy, cz)) {
-                " ⚠ SKIPPED (100% AIR)"
+                " ⚠ SKIPPED (mass AIR)"
             } else {
                 ""
             };
@@ -477,6 +502,8 @@ fn apply_save_data(
             );
         }
     }
+
+    (applied, skipped)
 }
 
 /// Write the quick-save (default path) from current in-memory state.
@@ -946,6 +973,39 @@ mod tests {
         assert_eq!(got, want);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The corruption guard must only trip on mass-AIR chunks, never on
+    /// ordinary digging. Regression test: the old predicate
+    /// (`solid == 0 && air > 0`) flagged a chunk after a SINGLE dig,
+    /// silently reverting the edit on reload.
+    #[test]
+    fn corruption_guard_thresholds() {
+        assert!(!is_corrupt_bucket(1, 0), "single dig flagged as corrupt");
+        assert!(!is_corrupt_bucket(200, 0), "small mine flagged as corrupt");
+        assert!(!is_corrupt_bucket(CORRUPT_AIR_ONLY_THRESHOLD - 1, 0));
+        assert!(is_corrupt_bucket(CORRUPT_AIR_ONLY_THRESHOLD, 0));
+        assert!(is_corrupt_bucket(crate::chunk::CHUNK_VOLUME as u32, 0));
+        // Any solid placement proves player intent — never corrupt.
+        assert!(!is_corrupt_bucket(4000, 1));
+    }
+
+    /// A save containing a single AIR modification (one dug block) must
+    /// survive the load path end to end: applied, not skipped.
+    #[test]
+    fn single_dig_survives_load() {
+        let save = LoadedSave {
+            player: None,
+            modifications: vec![(IVec3::new(52, 9, 31), BlockType::AIR.index())],
+            background_path: None,
+        };
+        let mut cm = ChunkManager::default();
+        let (applied, skipped) = apply_loaded_save(&save, &mut cm);
+        assert_eq!((applied, skipped), (1, 0));
+        assert_eq!(
+            cm.modifications.get(&IVec3::new(52, 9, 31)),
+            Some(&BlockType::AIR)
+        );
     }
 
     /// Legacy JSON saves (full and metadata-only) must still load — by
