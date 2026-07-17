@@ -801,13 +801,23 @@ impl Chunk {
                         let mut c2 = [0.0f32; 3];
                         let mut c3 = [0.0f32; 3];
 
-                        // The face sits at the boundary of the voxel in normal direction.
-                        // visible_block_faces places quads at min..min+1, so the
-                        // normal-axis position is already correct from min.
-                        c0[norm_ax] = _slice as f32;
-                        c1[norm_ax] = _slice as f32;
-                        c2[norm_ax] = _slice as f32;
-                        c3[norm_ax] = _slice as f32;
+                        // The face sits at the voxel boundary in the normal
+                        // direction: negative-facing quads lie at the voxel's
+                        // min plane (_slice), positive-facing at min + 1 —
+                        // exactly what quad_mesh_positions does on the naive
+                        // path. (Historical bug: using _slice for BOTH sank
+                        // every positive-facing merged quad one block into
+                        // the terrain; at elevation steps the offset exposed
+                        // sky-colored gaps — the "blue lakes".)
+                        let plane = if norm_sign > 0 {
+                            (_slice + 1) as f32
+                        } else {
+                            _slice as f32
+                        };
+                        c0[norm_ax] = plane;
+                        c1[norm_ax] = plane;
+                        c2[norm_ax] = plane;
+                        c3[norm_ax] = plane;
 
                         c0[ax_u] = start_u as f32;
                         c0[ax_v] = _v as f32;
@@ -1113,6 +1123,63 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Expand a mesh into the set of unit face cells it covers:
+    /// (normal_axis, normal_sign, plane, u, v) per covered 1×1 cell.
+    /// Quads are 4 consecutive vertices (emit_quad contract).
+    fn face_cells(mesh: &Mesh) -> HashSet<(usize, i8, i32, i32, i32)> {
+        let Some(bevy::mesh::VertexAttributeValues::Float32x3(ps)) =
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+        else { panic!("no positions") };
+        let Some(bevy::mesh::VertexAttributeValues::Float32x3(ns)) =
+            mesh.attribute(Mesh::ATTRIBUTE_NORMAL)
+        else { panic!("no normals") };
+        let mut cells = HashSet::new();
+        for q in 0..ps.len() / 4 {
+            let n = ns[q * 4];
+            let axis = (0..3).find(|&a| n[a].abs() > 0.5).unwrap();
+            let sign = if n[axis] > 0.0 { 1i8 } else { -1 };
+            let (ua, va) = match axis {
+                0 => (1, 2),
+                1 => (0, 2),
+                _ => (0, 1),
+            };
+            let corners = &ps[q * 4..q * 4 + 4];
+            let plane = corners[0][axis].round() as i32;
+            let fmin = |a: usize| corners.iter().map(|c| c[a]).fold(f32::INFINITY, f32::min);
+            let fmax = |a: usize| corners.iter().map(|c| c[a]).fold(f32::NEG_INFINITY, f32::max);
+            for u in (fmin(ua).round() as i32)..(fmax(ua).round() as i32) {
+                for v in (fmin(va).round() as i32)..(fmax(va).round() as i32) {
+                    cells.insert((axis, sign, plane, u, v));
+                }
+            }
+        }
+        cells
+    }
+
+    /// Greedy meshing must cover EXACTLY the same face cells at EXACTLY
+    /// the same planes as the naive path — merging may only change quad
+    /// sizes, never geometry. Regression test for the sunken-quad bug:
+    /// positive-facing merged quads were emitted at the voxel's min plane
+    /// instead of min+1, sinking them one block into the terrain and
+    /// opening sky-colored gaps at every elevation step ("blue lakes").
+    #[test]
+    fn greedy_covers_identical_faces_as_naive() {
+        for pos in [ChunkPos(1, 0, 2), ChunkPos(0, 0, 0), ChunkPos(3, 0, -2), ChunkPos(2, 0, 1)] {
+            let chunk = Chunk::generate(pos);
+            let naive = face_cells(&chunk.build_mesh(&NO_NEIGHBORS, false, false, 1.0, None));
+            let greedy = face_cells(&chunk.build_mesh(&NO_NEIGHBORS, true, false, 1.0, None));
+            let missing: Vec<_> = naive.difference(&greedy).take(6).collect();
+            let extra: Vec<_> = greedy.difference(&naive).take(6).collect();
+            assert!(
+                missing.is_empty() && extra.is_empty(),
+                "chunk {pos:?}: {} naive cells missing from greedy (e.g. {missing:?}), \
+                 {} extra (e.g. {extra:?})",
+                naive.difference(&greedy).count(),
+                greedy.difference(&naive).count(),
+            );
         }
     }
 
