@@ -29,13 +29,3 @@ pub fn home_dir() -> std::path::PathBuf {
 pub const fn taa_supported() -> bool {
     !cfg!(target_arch = "wasm32")
 }
-
-/// Whether SMAA can be used on this build.
-///
-/// False on web — pre-emptively, not from an observed failure. SMAA is a
-/// post-process pass built like TAA, so it may hit the same GLSL combined
-/// image-sampler wall; since that failure mode is a hard panic rather than a
-/// degraded image, it is gated until someone proves it translates.
-pub const fn smaa_supported() -> bool {
-    !cfg!(target_arch = "wasm32")
-}

@@ -553,9 +553,8 @@ fn spawn_player(
             }
         }
 
-        // SMAA — see lighting.rs; unsupported on web.
+        // SMAA
         match settings.smaa_mode.as_str() {
-            _ if !crate::platform::smaa_supported() => {}
             "low" => { cam.insert(bevy::anti_alias::smaa::Smaa { preset: bevy::anti_alias::smaa::SmaaPreset::Low }); }
             "medium" => { cam.insert(bevy::anti_alias::smaa::Smaa { preset: bevy::anti_alias::smaa::SmaaPreset::Medium }); }
             "high" => { cam.insert(bevy::anti_alias::smaa::Smaa { preset: bevy::anti_alias::smaa::SmaaPreset::High }); }

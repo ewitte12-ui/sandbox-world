@@ -173,16 +173,16 @@ impl GameSettings {
     /// deserialized from disk and anything a future UI adds. On native this
     /// compiles to nothing.
     ///
-    /// - TAA is confirmed fatal: its shader binds one texture to two samplers,
-    ///   GLSL ES 3.0 has only combined image-samplers, so naga cannot translate
-    ///   it and wgpu treats the failure as a panic. Selecting it kills the app.
-    /// - SMAA is disabled pre-emptively, NOT because it was observed to fail.
-    ///   It is a post-process pass of the same construction, so it plausibly
-    ///   hits the same wall; nobody has verified it either way. Re-enable it
-    ///   here if it is ever shown to translate cleanly.
+    /// - TAA is fatal: its shader binds one texture to two samplers, GLSL ES
+    ///   3.0 has only combined image-samplers, so naga cannot translate it and
+    ///   wgpu treats the failure as a panic. Selecting it kills the app.
     /// - SSAO needs 5 storage textures per stage; WebGL2 offers fewer, so Bevy
     ///   skips the plugin. Leaving it "on" would be a lie in the menu and would
     ///   also force Msaa::Off, costing anti-aliasing for no benefit.
+    ///
+    /// SMAA is deliberately NOT listed. It looks like TAA and was gated here at
+    /// first on that resemblance, but forcing it on under WebGL2 renders fine —
+    /// so the restriction was removed rather than kept on suspicion.
     fn coerce_web_unsupported(&mut self) -> bool {
         if !cfg!(target_arch = "wasm32") {
             return false;
@@ -190,10 +190,6 @@ impl GameSettings {
         let mut changed = false;
         if self.anti_aliasing == "taa" {
             self.anti_aliasing = "msaa4".to_string();
-            changed = true;
-        }
-        if self.smaa_mode != "off" {
-            self.smaa_mode = "off".to_string();
             changed = true;
         }
         if self.ssao_enabled {

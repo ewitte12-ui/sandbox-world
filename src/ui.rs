@@ -1589,19 +1589,13 @@ fn spawn_graphics_tab(parent: &mut ChildSpawnerCommands, settings: &GameSettings
             ));
         });
 
-    // SMAA (cycle button). The button stays visible on web so the menu layout
-    // is identical everywhere, but reads as unavailable rather than simply
-    // refusing to change when pressed.
-    let smaa_label = if !crate::platform::smaa_supported() {
-        "Off (unsupported on web)"
-    } else {
-        match settings.smaa_mode.as_str() {
-            "low" => "Low",
-            "medium" => "Medium",
-            "high" => "High",
-            "ultra" => "Ultra",
-            _ => "Off",
-        }
+    // SMAA (cycle button)
+    let smaa_label = match settings.smaa_mode.as_str() {
+        "low" => "Low",
+        "medium" => "Medium",
+        "high" => "High",
+        "ultra" => "Ultra",
+        _ => "Off",
     };
     parent
         .spawn((
@@ -2531,9 +2525,8 @@ fn handle_graphics_settings_buttons(
     }
 
     // SMAA cycle: off -> low -> medium -> high -> ultra -> off
-    // Not offered on web (see platform::smaa_supported).
     for i in &smaa_q {
-        if *i == Interaction::Pressed && crate::platform::smaa_supported() {
+        if *i == Interaction::Pressed {
             game_settings.smaa_mode = match game_settings.smaa_mode.as_str() {
                 "off" => "low".to_string(),
                 "low" => "medium".to_string(),

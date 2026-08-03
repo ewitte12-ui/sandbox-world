@@ -560,13 +560,7 @@ fn apply_render_pipeline_settings(
 
         // --- SMAA ---
         match settings.smaa_mode.as_str() {
-            // The settings sanitizer already forces SMAA off on web, but this
-            // guard is the one that matters: both run in Update with no
-            // ordering between them, so a frame could otherwise apply the
-            // unsanitized value and panic before sanitize corrects it.
-            _ if !crate::platform::smaa_supported() => {
-                commands.entity(entity).remove::<Smaa>();
-            }
+            // SMAA is fine under WebGL2 — verified, unlike TAA above.
             "low" => { commands.entity(entity).insert(Smaa { preset: SmaaPreset::Low }); }
             "medium" => { commands.entity(entity).insert(Smaa { preset: SmaaPreset::Medium }); }
             "high" => { commands.entity(entity).insert(Smaa { preset: SmaaPreset::High }); }
