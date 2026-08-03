@@ -284,6 +284,17 @@ pub struct WorldInitPending(pub bool);
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct WorldSpawnSet;
 
+/// Set by a system inside WorldSpawnSet, so consume_world_init can tell
+/// whether the set actually ran this frame instead of guessing from a frame
+/// count. See consume_world_init for why guessing was wrong.
+#[derive(Resource, Default)]
+pub struct WorldSpawnRan(pub bool);
+
+/// Last system-effect of WorldSpawnSet: records that the set executed.
+fn mark_world_spawn_ran(mut ran: ResMut<WorldSpawnRan>) {
+    ran.0 = true;
+}
+
 /// Observer: teardown despawn commands have been issued — start verification.
 fn on_teardown_issued(
     event: On<TeardownIssued>,
@@ -342,34 +353,39 @@ fn on_world_init_requested(_event: On<WorldInitRequested>, mut pending: ResMut<W
 
 /// Runs after all WorldSpawnSet systems to reset the one-shot flag.
 ///
-/// WorldInitPending is set mid-frame by the fence observer. Bevy's run
-/// conditions for WorldSpawnSet were already evaluated (as false) for that
-/// frame, so spawn systems don't actually execute until the NEXT frame.
-/// This system waits one full frame before consuming the flag, giving
-/// WorldSpawnSet a chance to see it.
+/// WorldInitPending is set mid-frame by the fence observer, so the flag can
+/// become true either before or after WorldSpawnSet's run condition is
+/// evaluated for that same frame — Bevy evaluates a set's condition just
+/// before the set runs, not at frame start, and nothing orders the observer's
+/// trigger (verify_teardown_complete) against WorldSpawnSet.
+///
+/// This previously waited a fixed two frames on the assumption that the set
+/// could never see the flag on the frame it was set. That assumption held
+/// under the multi-threaded executor but not the single-threaded one the web
+/// build uses, where verify_teardown_complete reliably runs first: the set
+/// then ran on BOTH frames and every world entity was spawned twice (62
+/// background plates against 31 expected).
+///
+/// So don't infer it — WorldSpawnSet reports whether it ran, and the flag is
+/// consumed the moment it has. Correct under any execution order.
 fn consume_world_init(
     mut pending: ResMut<WorldInitPending>,
-    mut frames_pending: Local<u32>,
+    mut ran: ResMut<WorldSpawnRan>,
 ) {
     if !pending.0 {
-        *frames_pending = 0;
+        // Keep the marker clean for the next init; the set cannot have run
+        // this frame, since its run condition includes WorldInitPending(true).
+        ran.0 = false;
         return;
     }
-    *frames_pending += 1;
-    // Frame 1: flag was just set (possibly mid-frame). WorldSpawnSet hasn't
-    // seen it yet — its run condition was evaluated before the observer fired.
-    // Frame 2: WorldSpawnSet evaluates condition as true, spawn systems run.
-    // consume_world_init runs after them (.after(WorldSpawnSet)), safe to reset.
-    if *frames_pending < 2 {
-        bevy::log::info!(
-            "WorldInitPending=true, waiting for spawn systems (frame {})",
-            *frames_pending,
-        );
+    if !ran.0 {
+        // Flag set after the set's condition was evaluated — spawn systems
+        // will run next frame. Hold the flag until they do.
         return;
     }
     bevy::log::info!("WorldInitPending consumed — spawn systems have run");
     pending.0 = false;
-    *frames_pending = 0;
+    ran.0 = false;
 }
 
 /// Teardown entry point: runs on OnEnter(Gameplay). Despawns all stale
@@ -713,6 +729,10 @@ fn main() {
             in_state(GameState::Gameplay)
                 .and(resource_equals(WorldInitPending(true)))
         ))
+        .init_resource::<WorldSpawnRan>()
+        // Inside the set, so it runs under exactly the same condition as the
+        // spawn systems and tells consume_world_init they executed.
+        .add_systems(Update, mark_world_spawn_ran.in_set(WorldSpawnSet))
         .add_systems(Update, consume_world_init
             .after(WorldSpawnSet)
             .run_if(in_state(GameState::Gameplay))
