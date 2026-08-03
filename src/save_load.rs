@@ -577,18 +577,30 @@ fn open_file_dialog(
         return;
     }
 
-    let start_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let start_dir = crate::platform::home_dir();
 
     let task = IoTaskPool::get().spawn(async move {
-        let handle = rfd::AsyncFileDialog::new()
-            .set_title(&format!("Load {} Save", crate::GAME_NAME))
-            // "json" kept for pre-V2 saves — the reader sniffs by content.
-            .add_filter(&format!("{} Save", crate::GAME_NAME), &["mwsave", "json"])
-            .set_directory(&start_dir)
-            .pick_file()
-            .await;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let handle = rfd::AsyncFileDialog::new()
+                .set_title(&format!("Load {} Save", crate::GAME_NAME))
+                // "json" kept for pre-V2 saves — the reader sniffs by content.
+                .add_filter(&format!("{} Save", crate::GAME_NAME), &["mwsave", "json"])
+                .set_directory(&start_dir)
+                .pick_file()
+                .await;
 
-        handle.map(|h| h.path().to_path_buf())
+            handle.map(|h| h.path().to_path_buf())
+        }
+        // The browser has no path-addressable filesystem, so there is nothing
+        // a picked file could resolve to here. Report a cancelled selection;
+        // the poll system already treats that as "user changed their mind"
+        // and cleans up without touching the world.
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = &start_dir;
+            None
+        }
     });
 
     commands.insert_resource(FileDialogTask { task });
@@ -736,12 +748,23 @@ fn collect_save_data(
 
 /// Generate a default save file name with a timestamp.
 fn default_save_name() -> String {
-    use std::time::SystemTime;
-    let secs = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("sandbox_world_{}.mwsave", secs)
+    // SystemTime::now() panics on wasm, and this runs before the dialog task
+    // is spawned, so it cannot be left to the cfg gate inside it. bevy_platform
+    // shims Instant but not SystemTime, and the web build has no save target to
+    // disambiguate anyway — a static name keeps the call site total.
+    #[cfg(target_arch = "wasm32")]
+    {
+        "sandbox_world.mwsave".to_string()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::time::SystemTime;
+        let secs = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        format!("sandbox_world_{}.mwsave", secs)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -789,19 +812,28 @@ fn open_save_dialog(
         }
     };
 
-    let start_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let start_dir = crate::platform::home_dir();
     let file_name = default_save_name();
 
     let task = IoTaskPool::get().spawn(async move {
-        let handle = rfd::AsyncFileDialog::new()
-            .set_title(&format!("Save {} Game", crate::GAME_NAME))
-            .add_filter(&format!("{} Save", crate::GAME_NAME), &["mwsave"])
-            .set_directory(&start_dir)
-            .set_file_name(&file_name)
-            .save_file()
-            .await;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let handle = rfd::AsyncFileDialog::new()
+                .set_title(&format!("Save {} Game", crate::GAME_NAME))
+                .add_filter(&format!("{} Save", crate::GAME_NAME), &["mwsave"])
+                .set_directory(&start_dir)
+                .set_file_name(&file_name)
+                .save_file()
+                .await;
 
-        handle.map(|h| h.path().to_path_buf())
+            handle.map(|h| h.path().to_path_buf())
+        }
+        // See open_file_dialog: no filesystem to save into on web yet.
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (&start_dir, &file_name);
+            None
+        }
     });
 
     commands.insert_resource(SaveDialogTask { task, bytes });
@@ -849,17 +881,13 @@ fn poll_save_dialog(
 
 /// Default quick-save path (V2 binary).
 pub fn save_path() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".metalworld_save.mwsave")
+    crate::platform::home_dir().join(".metalworld_save.mwsave")
 }
 
 /// Pre-V2 default path — read-only fallback so existing installs keep
 /// their world on first launch after the format change.
 fn legacy_save_path() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".metalworld_save.json")
+    crate::platform::home_dir().join(".metalworld_save.json")
 }
 
 /// Derive the screenshot path from a save file path.

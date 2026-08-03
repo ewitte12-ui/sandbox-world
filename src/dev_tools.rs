@@ -1,4 +1,7 @@
-use std::time::Instant;
+// bevy_platform's Instant, NOT std's: on wasm `std::time::Instant::now()`
+// panics outright ("time not implemented on this platform"), while this one
+// resolves to `web_time`, which is backed by performance.now().
+use bevy::platform::time::Instant;
 
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::prelude::*;
@@ -268,9 +271,15 @@ fn frame_limiter_system(
         return;
     }
 
-    let elapsed = limiter.last_frame_end.elapsed();
-    if elapsed < limiter.target_frame_time {
-        std::thread::sleep(limiter.target_frame_time - elapsed);
+    // Blocking the wasm main thread is not allowed — the browser paces frames
+    // via requestAnimationFrame, so there is nothing useful to sleep for and
+    // std::thread::sleep would panic. Fall through to just stamping the time.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let elapsed = limiter.last_frame_end.elapsed();
+        if elapsed < limiter.target_frame_time {
+            std::thread::sleep(limiter.target_frame_time - elapsed);
+        }
     }
     limiter.last_frame_end = Instant::now();
 }

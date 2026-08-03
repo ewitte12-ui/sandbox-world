@@ -4,18 +4,51 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bevy = { version = "0.18", features = ["debug"] }
+# NOTE: bevy's `debug` feature is deliberately NOT here — it is added only for
+# native below. Cargo unions features across a dependency graph, so listing it
+# here would force it into the wasm build too, where it costs tens of MB of
+# payload the browser has to download.
+bevy = { version = "0.18" }
 noise = "0.9"
 block-mesh = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bincode = "1"
-dirs = "6"
 rand = "0.8"
 image = "0.25"
+
+# Native-only: both reach for OS facilities that do not exist in a browser.
+# `dirs` resolves home/config paths; `rfd` opens native file dialogs.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+bevy = { version = "0.18", features = ["debug"] }
+dirs = "6"
 rfd = "0.15"
+
+# Web-only. Features union with the base `bevy` entry above, so `webgl2` and
+# `web` are added solely for wasm builds — enabling `webgl2` on native would
+# needlessly hold the renderer to WebGL2's limits.
+#
+# `getrandom`'s `js` feature is NOT optional: rand 0.8 pulls getrandom 0.2,
+# which refuses to compile for wasm32-unknown-unknown without a backend, since
+# that target has no inherent notion of an OS entropy source.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+bevy = { version = "0.18", features = ["webgl2", "web"] }
+getrandom = { version = "0.2", features = ["js"] }
 
 [profile.dev]
 opt-level = 1
 [profile.dev.package."*"]
 opt-level = 3
+
+# Tuned for download size, which is what gates the web build — a native binary
+# a few MB larger is irrelevant, a wasm payload tens of MB larger is not.
+# opt-level stays at 3 rather than "z": this is a voxel game whose frame time is
+# dominated by chunk meshing and per-voxel light propagation, and "z" costs more
+# in framerate than it saves in bytes.
+[profile.release]
+lto = "fat"          # cross-crate inlining + dead-code elimination across bevy
+codegen-units = 1    # better optimisation and dead-code removal than the default 16
+strip = "symbols"    # drops the wasm name section, which is pure payload in production
+# Deliberately NOT panic = "abort". It would shrink things slightly, but this
+# profile also builds the shipped desktop binaries: it would change their crash
+# semantics and break `cargo test --release`, which Cargo rejects for abort.

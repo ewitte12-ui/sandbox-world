@@ -543,26 +543,32 @@ fn spawn_player(
             match settings.anti_aliasing.as_str() {
                 "msaa2" => { cam.insert(Msaa::Sample2); }
                 "msaa4" => { cam.insert(Msaa::Sample4); }
-                "taa" => {
+                // See lighting.rs: TAA panics wgpu on web, so fall back to MSAA.
+                "taa" if crate::platform::taa_supported() => {
                     cam.insert(Msaa::Off);
                     cam.insert(bevy::anti_alias::taa::TemporalAntiAliasing::default());
                 }
+                "taa" => { cam.insert(Msaa::Sample4); }
                 _ => { cam.insert(Msaa::Off); }
             }
         }
 
-        // SMAA
+        // SMAA — see lighting.rs; unsupported on web.
         match settings.smaa_mode.as_str() {
+            _ if !crate::platform::smaa_supported() => {}
             "low" => { cam.insert(bevy::anti_alias::smaa::Smaa { preset: bevy::anti_alias::smaa::SmaaPreset::Low }); }
             "medium" => { cam.insert(bevy::anti_alias::smaa::Smaa { preset: bevy::anti_alias::smaa::SmaaPreset::Medium }); }
             "high" => { cam.insert(bevy::anti_alias::smaa::Smaa { preset: bevy::anti_alias::smaa::SmaaPreset::High }); }
             "ultra" => { cam.insert(bevy::anti_alias::smaa::Smaa { preset: bevy::anti_alias::smaa::SmaaPreset::Ultra }); }
             _ => {}
         }
-    } else {
+    } else if crate::platform::taa_supported() {
         // No settings — default to TAA
         cam.insert(Msaa::Off);
         cam.insert(bevy::anti_alias::taa::TemporalAntiAliasing::default());
+    } else {
+        // Web has no TAA; MSAA is the best available fallback here.
+        cam.insert(Msaa::Sample4);
     }
     // Cursor starts free (menu open). Grab happens when the player enters
     // gameplay via ui.rs (Play/Load button or closing the menu).

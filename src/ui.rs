@@ -1555,10 +1555,11 @@ fn spawn_graphics_tab(parent: &mut ChildSpawnerCommands, settings: &GameSettings
         &format!("{:.0}", settings.fov),
     );
 
-    // SSAO
+    // SSAO — WebGL2 lacks the storage textures Bevy's SSAO plugin needs, so
+    // the toggle is inert there and says so.
     toggle_button::<SsaoButton>(
         parent,
-        "SSAO",
+        if cfg!(target_arch = "wasm32") { "SSAO (unsupported on web)" } else { "SSAO" },
         settings.ssao_enabled,
     );
 
@@ -1588,13 +1589,19 @@ fn spawn_graphics_tab(parent: &mut ChildSpawnerCommands, settings: &GameSettings
             ));
         });
 
-    // SMAA (cycle button)
-    let smaa_label = match settings.smaa_mode.as_str() {
-        "low" => "Low",
-        "medium" => "Medium",
-        "high" => "High",
-        "ultra" => "Ultra",
-        _ => "Off",
+    // SMAA (cycle button). The button stays visible on web so the menu layout
+    // is identical everywhere, but reads as unavailable rather than simply
+    // refusing to change when pressed.
+    let smaa_label = if !crate::platform::smaa_supported() {
+        "Off (unsupported on web)"
+    } else {
+        match settings.smaa_mode.as_str() {
+            "low" => "Low",
+            "medium" => "Medium",
+            "high" => "High",
+            "ultra" => "Ultra",
+            _ => "Off",
+        }
     };
     parent
         .spawn((
@@ -2197,8 +2204,9 @@ fn handle_120fps_button(
     mut commands: Commands,
     menu_query: Query<Entity, With<SettingsMenu>>,
 ) {
+    // bevy_platform's Instant — std's panics on wasm. See dev_tools.rs.
     #[cfg(debug_assertions)]
-    let _start = std::time::Instant::now();
+    let _start = bevy::platform::time::Instant::now();
 
     let mut changed = false;
 
@@ -2395,12 +2403,16 @@ fn handle_tex_size_buttons(
     }
 
     // Anti-aliasing cycle: off -> msaa2 -> msaa4 -> taa -> off
+    // On web the cycle skips TAA entirely (msaa4 -> off) rather than offering
+    // a value the sanitizer would immediately revert, which would read as a
+    // dead button.
     for i in &aa_q {
         if *i == Interaction::Pressed {
             game_settings.anti_aliasing = match game_settings.anti_aliasing.as_str() {
                 "off" => "msaa2".to_string(),
                 "msaa2" => "msaa4".to_string(),
-                "msaa4" => "taa".to_string(),
+                "msaa4" if crate::platform::taa_supported() => "taa".to_string(),
+                "msaa4" => "off".to_string(),
                 "taa" => "off".to_string(),
                 _ => "off".to_string(),
             };
@@ -2494,9 +2506,11 @@ fn handle_graphics_settings_buttons(
         }
     }
 
-    // SSAO toggle
+    // SSAO toggle. Inert on web — WebGL2 offers too few storage textures per
+    // stage, so Bevy never loads the plugin. Ignoring the press keeps the menu
+    // honest instead of showing "on" for something that does nothing.
     for i in &ssao_q {
-        if *i == Interaction::Pressed {
+        if *i == Interaction::Pressed && !cfg!(target_arch = "wasm32") {
             game_settings.ssao_enabled = !game_settings.ssao_enabled;
             changed = true;
         }
@@ -2517,8 +2531,9 @@ fn handle_graphics_settings_buttons(
     }
 
     // SMAA cycle: off -> low -> medium -> high -> ultra -> off
+    // Not offered on web (see platform::smaa_supported).
     for i in &smaa_q {
-        if *i == Interaction::Pressed {
+        if *i == Interaction::Pressed && crate::platform::smaa_supported() {
             game_settings.smaa_mode = match game_settings.smaa_mode.as_str() {
                 "off" => "low".to_string(),
                 "low" => "medium".to_string(),
@@ -2570,20 +2585,32 @@ fn handle_load_texture_buttons(
 
         let block_name = btn.block_name.clone();
         let block_idx = btn.block_idx;
-        let start_dir = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let start_dir = crate::platform::home_dir();
 
         let task = bevy::tasks::IoTaskPool::get().spawn(async move {
-            let handle = rfd::AsyncFileDialog::new()
-                .set_title("Select Block Texture")
-                .add_filter("Images", &["png", "jpg", "jpeg", "bmp", "tga"])
-                .set_directory(&start_dir)
-                .pick_file()
-                .await;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let handle = rfd::AsyncFileDialog::new()
+                    .set_title("Select Block Texture")
+                    .add_filter("Images", &["png", "jpg", "jpeg", "bmp", "tga"])
+                    .set_directory(&start_dir)
+                    .pick_file()
+                    .await;
 
-            let handle = handle?;
-            let path = handle.path().to_path_buf();
-            let data = std::fs::read(&path).ok()?;
-            Some((path, data))
+                let handle = handle?;
+                let path = handle.path().to_path_buf();
+                let data = std::fs::read(&path).ok()?;
+                Some((path, data))
+            }
+            // rfd's web backend hands back opaque file handles with no path,
+            // so the (path, bytes) contract this task promises cannot be met
+            // until custom textures get a web-native path. Blocks keep their
+            // solid-colour defaults meanwhile.
+            #[cfg(target_arch = "wasm32")]
+            {
+                let _ = &start_dir;
+                None
+            }
         });
 
         commands.insert_resource(TextureDialogTask {
@@ -2816,19 +2843,29 @@ fn handle_add_block_button(
             continue;
         }
 
-        let start_dir = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let start_dir = crate::platform::home_dir();
         let task = bevy::tasks::IoTaskPool::get().spawn(async move {
-            let handle = rfd::AsyncFileDialog::new()
-                .set_title("Select Texture for New Block")
-                .add_filter("Images", &["png", "jpg", "jpeg", "bmp", "tga"])
-                .set_directory(&start_dir)
-                .pick_file()
-                .await;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let handle = rfd::AsyncFileDialog::new()
+                    .set_title("Select Texture for New Block")
+                    .add_filter("Images", &["png", "jpg", "jpeg", "bmp", "tga"])
+                    .set_directory(&start_dir)
+                    .pick_file()
+                    .await;
 
-            let handle = handle?;
-            let path = handle.path().to_path_buf();
-            let data = std::fs::read(&path).ok()?;
-            Some((path, data))
+                let handle = handle?;
+                let path = handle.path().to_path_buf();
+                let data = std::fs::read(&path).ok()?;
+                Some((path, data))
+            }
+            // See handle_load_texture_buttons: no path-addressable file
+            // handles on web.
+            #[cfg(target_arch = "wasm32")]
+            {
+                let _ = &start_dir;
+                None
+            }
         });
 
         commands.insert_resource(AddBlockDialogTask { task });

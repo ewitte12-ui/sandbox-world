@@ -163,6 +163,43 @@ impl GameSettings {
             self.render_scale = clamped;
             changed = true;
         }
+        changed |= self.coerce_web_unsupported();
+        changed
+    }
+
+    /// Force settings the web backend cannot honour onto values it can.
+    ///
+    /// Done centrally rather than at each consumer so it also covers settings
+    /// deserialized from disk and anything a future UI adds. On native this
+    /// compiles to nothing.
+    ///
+    /// - TAA is confirmed fatal: its shader binds one texture to two samplers,
+    ///   GLSL ES 3.0 has only combined image-samplers, so naga cannot translate
+    ///   it and wgpu treats the failure as a panic. Selecting it kills the app.
+    /// - SMAA is disabled pre-emptively, NOT because it was observed to fail.
+    ///   It is a post-process pass of the same construction, so it plausibly
+    ///   hits the same wall; nobody has verified it either way. Re-enable it
+    ///   here if it is ever shown to translate cleanly.
+    /// - SSAO needs 5 storage textures per stage; WebGL2 offers fewer, so Bevy
+    ///   skips the plugin. Leaving it "on" would be a lie in the menu and would
+    ///   also force Msaa::Off, costing anti-aliasing for no benefit.
+    fn coerce_web_unsupported(&mut self) -> bool {
+        if !cfg!(target_arch = "wasm32") {
+            return false;
+        }
+        let mut changed = false;
+        if self.anti_aliasing == "taa" {
+            self.anti_aliasing = "msaa4".to_string();
+            changed = true;
+        }
+        if self.smaa_mode != "off" {
+            self.smaa_mode = "off".to_string();
+            changed = true;
+        }
+        if self.ssao_enabled {
+            self.ssao_enabled = false;
+            changed = true;
+        }
         changed
     }
 
@@ -174,9 +211,7 @@ impl GameSettings {
     }
 
     fn settings_path() -> std::path::PathBuf {
-        dirs::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".metalworld_settings.json")
+        crate::platform::home_dir().join(".metalworld_settings.json")
     }
 }
 

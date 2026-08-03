@@ -7,6 +7,7 @@ mod chunk;
 mod chunk_manager;
 mod dev_tools;
 mod lighting;
+mod platform;
 mod player;
 mod ray_cast;
 mod save_load;
@@ -667,6 +668,17 @@ fn main() {
             saved.window_width as u32,
             saved.window_height as u32,
         );
+    }
+
+    // On web the page owns the canvas: winit binds to the element below and
+    // tracks its parent's size, so the saved resolution and fullscreen mode
+    // above do not apply. Sizing is CSS-driven in web/index.html. Settings
+    // still round-trip through GameSettings; they simply have no effect here.
+    #[cfg(target_arch = "wasm32")]
+    {
+        window.mode = bevy::window::WindowMode::Windowed;
+        window.canvas = Some("#metalworld-canvas".into());
+        window.fit_canvas_to_parent = true;
     }
 
     App::new()
