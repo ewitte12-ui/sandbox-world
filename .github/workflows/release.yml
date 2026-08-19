@@ -67,25 +67,61 @@ jobs:
             target/aarch64-apple-darwin/release/sandbox_world
           strip target/release/sandbox_world
 
-      - name: Package
+      - name: Package (macOS .app)
+        if: matrix.platform == 'macos'
         shell: bash
         run: |
-          mkdir -p dist/sandbox_world
-          if [ "${{ matrix.platform }}" = "windows" ]; then
-            cp target/release/sandbox_world.exe dist/sandbox_world/
-          else
-            cp target/release/sandbox_world dist/sandbox_world/
-          fi
-          # Assets MUST sit next to the executable: run standalone (not via
-          # cargo), Bevy resolves `assets/` relative to the binary.
-          cp -R assets dist/sandbox_world/
-          find dist -name '.DS_Store' -delete
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          APP="stage/Sandbox World.app"
+          mkdir -p "$APP/Contents/MacOS" dist
+          cp target/release/sandbox_world "$APP/Contents/MacOS/"
+          # ASSET PATH CONTRACT: bevy_asset resolves `assets/` against
+          # current_exe().parent() (see bevy_asset io/file/mod.rs
+          # get_base_path), so assets must sit BESIDE the binary in
+          # Contents/MacOS. The idiomatic Contents/Resources location ships an
+          # app that launches to a window and then finds no assets at all.
+          cp -R assets "$APP/Contents/MacOS/"
+          find stage -name '.DS_Store' -delete
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>Sandbox World</string>
+            <key>CFBundleDisplayName</key><string>Sandbox World</string>
+            <key>CFBundleExecutable</key><string>sandbox_world</string>
+            <key>CFBundleIdentifier</key><string>org.ewtco.sandboxworld</string>
+            <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>$VERSION</string>
+            <key>CFBundleVersion</key><string>$VERSION</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <!-- Without this macOS runs the game at 1x and upscales it, which
+                 on a Retina display looks materially blurrier. -->
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          # ditto, not plain zip: actions/upload-artifact does not preserve the
+          # executable bit, so shipping the .app bare would download as a
+          # non-runnable bundle. An inner archive carries the mode bits through.
+          ditto -c -k --sequesterRsrc --keepParent "$APP" dist/sandbox_world-macos.zip
+
+      - name: Package (Windows)
+        if: matrix.platform == 'windows'
+        shell: bash
+        run: |
+          mkdir -p stage/sandbox_world dist
+          cp target/release/sandbox_world.exe stage/sandbox_world/
+          # Same asset contract as macOS: next to the executable.
+          cp -R assets stage/sandbox_world/
+          (cd stage && 7z a -tzip -mx=9 ../dist/sandbox_world-windows.zip sandbox_world > /dev/null)
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: sandbox_world-${{ matrix.platform }}
-          path: dist/sandbox_world
+          path: dist/*.zip
 
   publish:
     # Publishes to itch.io ONLY on a version tag AND only if BUTLER_API_KEY
@@ -111,5 +147,11 @@ jobs:
           unzip -q butler.zip
           chmod +x butler
           VERSION="${GITHUB_REF_NAME#v}"
-          ./butler push artifacts/sandbox_world-macos   "$ITCH_TARGET:mac"     --userversion "$VERSION"
-          ./butler push artifacts/sandbox_world-windows "$ITCH_TARGET:windows" --userversion "$VERSION"
+          # The artifacts are zips (see the packaging steps, which archive so
+          # the executable bit survives upload-artifact). butler wants a
+          # directory, so unpack first — unzip restores the stored mode bits.
+          mkdir -p push/mac push/windows
+          unzip -q artifacts/sandbox_world-macos/sandbox_world-macos.zip     -d push/mac
+          unzip -q artifacts/sandbox_world-windows/sandbox_world-windows.zip -d push/windows
+          ./butler push push/mac     "$ITCH_TARGET:mac"     --userversion "$VERSION"
+          ./butler push push/windows "$ITCH_TARGET:windows" --userversion "$VERSION"
