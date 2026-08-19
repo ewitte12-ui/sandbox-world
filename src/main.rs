@@ -8,6 +8,12 @@
 //! day/night cycle, a first-person player, wandering animals, a title menu, and
 //! saved worlds.
 
+// Release builds on Windows launch without a console window. Without this a
+// double-clicked .exe opens a black console beside the game — the same wart the
+// macOS .app bundle exists to avoid. Debug builds keep the console, since that
+// is where the log goes and losing it would make `cargo run` silent.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod animals;
 mod block_types;
 mod buildings;
