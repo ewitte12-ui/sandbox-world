@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Sandbox World</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #0d0f14;
+        color: #d7dce5;
+        font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+
+      /* Bevy binds to this element and, with fit_canvas_to_parent, tracks the
+         size of its parent — so the canvas is sized by CSS here, not by the
+         saved window resolution the native build uses. */
+      #canvas-wrap {
+        position: fixed;
+        inset: 0;
+      }
+
+      #sandbox-world-canvas {
+        display: block;
+        width: 100%;
+        height: 100%;
+        outline: none;
+      }
+
+      #status {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 0.75rem;
+        align-items: center;
+        justify-content: center;
+        text-align: center;
+        padding: 1.5rem;
+        background: #0d0f14;
+        transition: opacity 0.4s ease;
+      }
+
+      #status.hidden {
+        opacity: 0;
+        pointer-events: none;
+      }
+
+      #status h1 {
+        margin: 0;
+        font-size: 1.25rem;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+      }
+
+      #status p {
+        margin: 0;
+        max-width: 34rem;
+        font-size: 0.9rem;
+        line-height: 1.5;
+        color: #8f98a8;
+      }
+
+      #status code {
+        color: #c8b98a;
+      }
+
+      .error {
+        color: #e5837d !important;
+        white-space: pre-wrap;
+        text-align: left;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 0.8rem;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="canvas-wrap">
+      <!-- tabindex makes the canvas focusable so it receives key events. -->
+      <canvas id="sandbox-world-canvas" tabindex="0"></canvas>
+    </div>
+
+    <div id="status">
+      <h1>Loading Sandbox World…</h1>
+      <p>
+        Fetching the engine and world assets. The first load is large and is not
+        cached yet, so give it a moment.
+      </p>
+    </div>
+
+    <script type="module">
+      const status = document.getElementById("status");
+
+      function fail(heading, detail) {
+        status.classList.remove("hidden");
+        status.innerHTML = "";
+        const h = document.createElement("h1");
+        h.textContent = heading;
+        const p = document.createElement("p");
+        p.className = "error";
+        p.textContent = detail;
+        status.append(h, p);
+      }
+
+      function start() {
+        status.classList.add("hidden");
+        document.getElementById("sandbox-world-canvas").focus();
+      }
+
+      // Opening the page straight off disk is the likeliest first mistake, and
+      // the browser's own error ("Failed to fetch dynamically imported module")
+      // explains none of it. ES modules and WebAssembly both need an HTTP
+      // origin. Note this must be the BUILT page in web/dist/ — web/index.html
+      // is a template with no sandbox_world.js beside it until build.sh runs.
+      if (location.protocol === "file:") {
+        fail(
+          "Open this over HTTP, not file://",
+          "Browsers refuse to load ES modules and WebAssembly from the filesystem.\n\n" +
+            "  web/serve.sh\n\n" +
+            "then open http://localhost:8080/ — serving web/dist/, not web/.",
+        );
+      } else if (!document.createElement("canvas").getContext("webgl2")) {
+        // WebGL2 is the floor: the block renderer samples a 64-layer texture
+        // array, which WebGL1 cannot express.
+        fail(
+          "WebGL2 is not available",
+          "This browser or device does not expose a WebGL2 context. On desktop Safari, check Settings → Advanced; on older hardware, WebGL2 may be blocklisted entirely.",
+        );
+      } else {
+        try {
+          const init = (await import("./sandbox_world.js")).default;
+          await init();
+          start();
+        } catch (err) {
+          const msg = String(err && err.message ? err.message : err);
+          // winit yields to the browser event loop by throwing; not a failure.
+          if (msg.includes("Using exceptions for control flow")) {
+            start();
+          } else if (msg.includes("dynamically imported module")) {
+            fail(
+              "Engine glue not found",
+              "sandbox_world.js could not be loaded from this directory.\n\n" +
+                "Serve the BUILT output:\n  web/build.sh && web/serve.sh\n\n" +
+                "Opening web/index.html directly will always fail — the glue and\n" +
+                "the .wasm only exist in web/dist/ after a build.",
+            );
+          } else {
+            fail("Failed to start", msg);
+          }
+        }
+      }
+    </script>
+  </body>
+</html>

@@ -1,0 +1,6 @@
+MOVEMENT CONTACT CONTRACT
+
+- Ground ≠ wall ≠ ceiling ≠ slope
+- Walls block horizontal movement only
+- Gravity continues unless grounded
+- Surface roles must be explicit before becoming load-bearing

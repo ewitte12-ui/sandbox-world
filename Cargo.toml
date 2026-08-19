@@ -1,0 +1,86 @@
+[package]
+name = "sandbox_world"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+
+[dependencies]
+# `default-features = false` + the three collections we actually use. Bevy
+# 0.19's `default` is ["2d", "3d", "ui", "audio"]; this is that list minus
+# audio, which the game never uses and which drags in symphonia decoders —
+# dead weight in a native binary and real download cost on the web.
+#
+# All three collections are needed:
+#   3d  — pbr, meshes, lights, the block material
+#   2d  — Camera2d for the UI/menu pass and the render-scale blit Sprite
+#         (see guardrails/05_pixel_perfect_rendering.txt)
+#   ui  — bevy_ui, text, and (new in 0.19) bevy_ui_widgets
+#
+# They transitively pull `common_api` (gizmos, png, text, material, window)
+# and `default_platform` (winit, default_font, multi_threaded, x11, wayland,
+# custom_cursor, sysinfo_plugin), so those need no separate mention.
+#
+# NOTE: bevy's `debug` feature is deliberately NOT here — it is added only for
+# native below. Cargo unions features across a dependency graph, so listing it
+# here would force it into the wasm build too, where it costs tens of MB of
+# payload the browser has to download.
+bevy = { version = "0.19", default-features = false, features = ["2d", "3d", "ui"] }
+noise = "0.9"
+block-mesh = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Save serialisation. 1.x is serde-native, so the save structs are plain
+# `#[derive(Serialize, Deserialize)]` with no second derive macro and no encode
+# config threaded through call sites. There is no external format to match —
+# saves carry their own `FORMAT_VERSION` and are refused when it disagrees — so
+# 2.x/3.x would be API churn for no behaviour we need. Revisit if we ever want
+# its no-std or borrowed-decode support.
+bincode = "1"
+# Pinned to 0.8 on purpose: 0.9 renamed the core surface (thread_rng -> rng,
+# gen_range -> random_range) and 0.9+ moves to getrandom 0.3, which changes the
+# wasm entropy backend story. Neither buys this game anything.
+rand = "0.8"
+image = "0.25"
+
+# Native-only: both reach for OS facilities that do not exist in a browser.
+# `dirs` resolves home/config paths; `rfd` opens native file dialogs.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# `default-features = false` must be repeated here. Cargo unions features across
+# every entry for a dependency, and an entry that omits this flag re-enables the
+# default set for the whole graph — which silently dragged `audio` (and rodio,
+# symphonia, ...) back into the build until this was added.
+bevy = { version = "0.19", default-features = false, features = ["debug"] }
+dirs = "6"
+rfd = "0.15"
+
+# Web-only. Features union with the base `bevy` entry above, so `web` is added
+# solely for wasm builds.
+#
+# Unlike 0.18, `webgl2` is NOT listed here: Bevy 0.19 folded it into the
+# `default_platform` collection, so the 2d/3d/ui features already enable it.
+# It is inert on native (the WebGL backend is cfg'd to wasm32).
+#
+# `getrandom`'s `js` feature is NOT optional: rand 0.8 pulls getrandom 0.2,
+# which refuses to compile for wasm32-unknown-unknown without a backend, since
+# that target has no inherent notion of an OS entropy source.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+bevy = { version = "0.19", default-features = false, features = ["web"] }
+getrandom = { version = "0.2", features = ["js"] }
+
+[profile.dev]
+opt-level = 1
+[profile.dev.package."*"]
+opt-level = 3
+
+# Tuned for download size, which is what gates the web build — a native binary
+# a few MB larger is irrelevant, a wasm payload tens of MB larger is not.
+# opt-level stays at 3 rather than "z": this is a voxel game whose frame time is
+# dominated by chunk meshing and per-voxel light propagation, and "z" costs more
+# in framerate than it saves in bytes.
+[profile.release]
+lto = "fat"          # cross-crate inlining + dead-code elimination across bevy
+codegen-units = 1    # better optimisation and dead-code removal than the default 16
+strip = "symbols"    # drops the wasm name section, which is pure payload in production
+# Deliberately NOT panic = "abort". It would shrink things slightly, but this
+# profile also builds the shipped desktop binaries: it would change their crash
+# semantics and break `cargo test --release`, which Cargo rejects for abort.

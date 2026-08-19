@@ -1,0 +1,78 @@
+SOURCE CODE DOCUMENTATION GUARDRAIL
+=================================
+
+PURPOSE
+-------
+Ensure the codebase remains readable, debuggable, and safe to modify over time.
+Documentation must support correctness and future change, not explain obvious syntax.
+
+CORE PRINCIPLES
+---------------
+1) Document *why*, not *what*.
+2) Prefer contracts and invariants over prose.
+3) Keep documentation co-located with the code it governs.
+4) If behavior is subtle, dangerous, or load-bearing, it must be documented.
+
+WHAT MUST BE DOCUMENTED (REQUIRED)
+---------------------------------
+- System responsibilities and ownership boundaries
+- Execution order assumptions and dependencies
+- State-machine invariants and guard conditions
+- Non-obvious edge cases (corner cases, race conditions)
+- Reasoning behind constraints and limits
+- Any workaround that is intentionally preserved
+
+WHAT MUST NOT BE DOCUMENTED
+---------------------------
+- Obvious language syntax
+- Trivial getters/setters
+- Self-explanatory math or code
+- Temporary hacks without a fix plan
+
+COMMENT TYPES
+-------------
+A) CONTRACT COMMENTS
+- State invariants
+- Preconditions / postconditions
+- What must never happen
+
+B) ORDERING COMMENTS
+- System order requirements
+- Dependencies between systems
+
+C) RATIONALE COMMENTS
+- Why this approach was chosen
+- Why alternatives were rejected
+
+D) WARNING COMMENTS
+- Explicit markers for dangerous changes
+- Consequences if violated
+
+STYLE RULES
+-----------
+- Be concise and declarative
+- Use bullet points for invariants
+- Avoid narrative explanations
+- Prefer CHECKLIST-style language
+
+EXAMPLE (GOOD)
+--------------
+// INVARIANT:
+// - transition_started is set exactly once
+// - Player position is irrelevant after this flag is true
+// Violating this causes scene transition deadlocks.
+
+EXAMPLE (BAD)
+-------------
+// This function checks if the player is in the trigger
+// and then starts the transition if they are.
+
+UPDATE RULE
+-----------
+If behavior changes, documentation must be updated in the same commit.
+Documentation that lies is worse than no documentation.
+
+SIGN-OFF
+--------
+This guardrail is non-negotiable.
+Any system that becomes load-bearing must comply.

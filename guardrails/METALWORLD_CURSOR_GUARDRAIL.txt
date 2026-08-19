@@ -1,0 +1,70 @@
+METALWORLD — CURSOR & MOUSE CONTROL GUARDRAIL
+
+INTENT
+Metalworld is a gameplay-driven voxel game that does not use an OS mouse cursor during active gameplay. The mouse must behave as a relative input device, not a pointer.
+
+This guardrail ensures:
+- No visible OS cursor during gameplay
+- No cursor escape from the game window
+- No "click to focus" friction
+- Cursor is only available when explicitly in menus
+
+NON-NEGOTIABLE RULES
+
+1. Gameplay Mode Cursor Rules
+When the game is in active gameplay mode:
+- OS cursor must be hidden
+- Cursor must be grabbed/locked to the primary window
+- Cursor grab mode must be CursorGrabMode::Locked
+- Platform fallback behavior is acceptable
+- Cursor state must be idempotent
+
+2. Startup Behavior
+At application startup:
+- Cursor must be hidden
+- Cursor must be locked to the primary window
+- Applied in a Startup system
+- Must not rely on user input
+
+3. Window Focus Handling
+If the window loses and regains focus:
+- On focus regained, gameplay cursor rules must be re-asserted
+- No delays, timers, or frame counters
+
+4. Menu Mode Cursor Rules
+The OS cursor may only be visible and free when a menu or UI-driven mode is explicitly active.
+- Cursor visible
+- CursorGrabMode::None
+
+5. Transition Rules
+Gameplay -> Menu:
+- Release cursor grab
+- Show OS cursor
+
+Menu -> Gameplay:
+- Hide OS cursor
+- Re-lock cursor exactly as in startup
+
+Transitions must be reversible and safe to call multiple times.
+
+6. Scope Constraints
+- Use Bevy window APIs only
+- Use PrimaryWindow
+- No platform-specific conditionals
+- No modification of input, camera, or gameplay systems beyond cursor control
+
+DISALLOWED BEHAVIORS
+- Visible OS cursor during gameplay
+- Cursor escaping the window during gameplay
+- Requiring a click to activate the game
+- Cursor logic tied implicitly to input events
+
+ACCEPTANCE CRITERIA
+- Game launches windowed with cursor hidden and locked
+- Cursor never appears during gameplay
+- Alt-tab restores correct cursor state
+- Menus reliably show and release cursor
+- Exiting menus restores gameplay cursor behavior
+
+GUARDRAIL STATUS
+This guardrail is foundational and non-optional for Metalworld. Any violation is a regression.

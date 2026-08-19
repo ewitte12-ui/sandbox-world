@@ -1,0 +1,6 @@
+PIXEL / GRID CORRECT RENDERING
+
+- Single pixel authority
+- Do not mix float rendering with snapped layers
+- Camera-snapped or sprite-snapped, never both
+- Rendering is integer space only

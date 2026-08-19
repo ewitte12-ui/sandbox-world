@@ -1,0 +1,7 @@
+ARCHITECTURE GUARDRAILS
+
+- Fix root causes, not symptoms
+- Separate geometry, rendering, movement, enemies, tuning
+- Use explicit sign-off states
+- Cascades indicate structural truth
+- Never tune around a broken system
