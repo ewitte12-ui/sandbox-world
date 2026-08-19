@@ -21,3 +21,6 @@
 # Runtime save files
 saves/
 *.save
+
+# Downloaded CI build artifacts (macOS .app + Windows zip)
+/dist/
